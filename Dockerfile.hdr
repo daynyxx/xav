@@ -1,0 +1,32 @@
+FROM docker.io/library/fedora:43
+
+# Install Rust
+RUN dnf update -y && dnf install -y curl
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustc --version
+
+# Install NVIDIA drivers and CUDA toolkit
+RUN dnf install -y kernel-devel kernel-headers
+RUN dnf config-manager addrepo --from-repofile=https://developer.download.nvidia.com/compute/cuda/repos/fedora43/$(uname -m)/cuda-fedora43.repo
+RUN dnf clean all
+RUN dnf config-manager setopt cuda-fedora43-$(uname -m).exclude=nvidia-driver,nvidia-modprobe,nvidia-persistenced,nvidia-settings,nvidia-libXNVCtrl,nvidia-xconfig
+RUN dnf install -y cuda-toolkit-13-2
+RUN ln -sf /usr/local/cuda-13-2 /usr/local/cuda
+ENV PATH="/usr/local/cuda/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+
+# Build vship
+RUN dnf install -y clang ffms2-devel libavutil-free-devel git
+RUN mkdir /vship
+WORKDIR /vship
+RUN git clone https://codeberg.org/Line-fr/Vship.git ./
+RUN make buildcuda && make buildFFVSHIP && make install PREFIX=/usr
+
+RUN mkdir /xav
+WORKDIR /xav
+COPY ./ /xav
+RUN dnf install -y glibc-static libstdc++-static nasm rustup clang clang-libs llvm lld compiler-rt llvm-libunwind-static autoconf automake libtool cmake ninja-build pkgconf meson
+RUN dnf install -y ffmpeg-free-devel gpac mkvtoolnix ffmpeg-free
+RUN /xav/build.sh static_tq hdr
+RUN cp /xav/target/x86_64-unknown-linux-gnu/release/xav /usr/bin/xav
