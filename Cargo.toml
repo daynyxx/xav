@@ -15,15 +15,19 @@ categories = ["multimedia::video", "command-line-utilities"]
 default = [ "vship" ]
 static = []
 vship = []
+svt-essential = []
 
 [dependencies]
-libc = "0.2.185"
+libc = "0.2.186"
 crossbeam-channel = "0.5.15"
-av-scenechange = { git = "https://github.com/emrakyz/av-scenechange", default-features = false, features = ["asm", "static_simd"] }
 ebur128 = "0.1.10"
 sonic-rs = "0.5.8"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
+av-scenechange = { git = "https://github.com/emrakyz/av-scenechange" }
+
+[build-dependencies]
+nasm-rs = { version = "0.3.2", features = ["parallel"] }
 
 [profile.release]
 opt-level = 3
@@ -46,6 +50,7 @@ pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
 many_single_char_names = "allow"
+similar_names = "allow"
 cast_possible_truncation = "allow"
 cast_possible_wrap = "allow"
 cast_sign_loss = "allow"
@@ -61,7 +66,6 @@ get_unwrap = "deny"
 panic = "deny"
 panic_in_result_fn ="deny"
 unreachable = "deny"
-big_endian_bytes = "deny"
 as_pointer_underscore = "deny"
 absolute_paths = "deny"
 as_underscore = "deny"
@@ -94,10 +98,7 @@ map_with_unused_argument_over_ranges = "deny"
 mem_forget = "deny"
 missing_assert_message = "deny"
 missing_asserts_for_indexing = "deny"
-missing_trait_methods = "deny"
 mixed_read_write_in_expression = "deny"
-mod_module_files = "deny"
-module_name_repetitions = "deny"
 modulo_arithmetic = "deny"
 multiple_inherent_impl = "deny"
 mutex_atomic = "deny"

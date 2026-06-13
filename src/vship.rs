@@ -1,7 +1,9 @@
 use std::{
-    ffi::{CStr, CString},
+    ffi::{CStr, CString, c_void},
     mem::{MaybeUninit, zeroed},
-    ptr::{from_mut, null},
+    ops::{Deref, DerefMut},
+    ptr::{NonNull, from_mut, null, null_mut},
+    slice::{from_raw_parts, from_raw_parts_mut},
 };
 
 use crate::{
@@ -25,8 +27,8 @@ use crate::{
     },
 };
 
-#[inline]
 #[cold]
+#[inline(never)]
 fn vship_err_str(buf: &MaybeUninit<[u8; 1024]>) -> Xerr {
     unsafe {
         Msg(CStr::from_ptr(buf.as_ptr().cast())
@@ -202,6 +204,8 @@ enum VshipException {
 
 unsafe extern "C" {
     fn Vship_SetDevice(gpu_id: i32) -> VshipException;
+    fn Vship_PinnedMalloc(ptr: *mut *mut c_void, size: u64) -> VshipException;
+    fn Vship_PinnedFree(ptr: *mut c_void) -> VshipException;
     fn Vship_SSIMU2Init(
         handler: *mut VshipSSIMU2Handler,
         src_colorspace: VshipColorspace,
@@ -259,10 +263,65 @@ unsafe extern "C" {
     fn Vship_GetDetailedLastError(out_msg: *mut i8, len: i32) -> i32;
 }
 
+pub struct PinnedBuf {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl PinnedBuf {
+    pub fn new(len: usize) -> Result<Self, Xerr> {
+        if len == 0 {
+            return Ok(Self {
+                ptr: NonNull::dangling().as_ptr(),
+                len: 0,
+            });
+        }
+        unsafe {
+            let mut ptr: *mut c_void = null_mut();
+            let ret = Vship_PinnedMalloc(&raw mut ptr, len as u64);
+            if ret as i32 != 0 {
+                let mut errbuf = MaybeUninit::<[u8; 1024]>::uninit();
+                vship_get_err(&mut errbuf);
+                return Err(vship_err_str(&errbuf));
+            }
+            Ok(Self {
+                ptr: ptr.cast(),
+                len,
+            })
+        }
+    }
+}
+
+impl Deref for PinnedBuf {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        unsafe { from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl DerefMut for PinnedBuf {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [u8] {
+        unsafe { from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for PinnedBuf {
+    fn drop(&mut self) {
+        if self.len != 0 {
+            unsafe {
+                Vship_PinnedFree(self.ptr.cast());
+            }
+        }
+    }
+}
+
 pub struct VshipProcessor {
     handler: Option<VshipSSIMU2Handler>,
     cvvdp_handler: Option<VshipCVVDPHandler>,
-    butteraugli_handler: Option<VshipButteraugliHandler>,
+    butter_handler: Option<VshipButteraugliHandler>,
 }
 
 pub fn init_device() -> Result<(), Xerr> {
@@ -283,9 +342,9 @@ impl VshipProcessor {
         height: u32,
         inf: &VidInf,
         use_cvvdp: bool,
-        use_butteraugli: bool,
+        use_butter: bool,
         cvvdp_model: Option<&str>,
-        cvvdp_config: Option<&str>,
+        cvvdp_conf: Option<&str>,
     ) -> Result<Self, Xerr> {
         let fps = inf.fps_num as f32 / inf.fps_den as f32;
         unsafe {
@@ -294,7 +353,7 @@ impl VshipProcessor {
 
             let mut errbuf = MaybeUninit::<[u8; 1024]>::uninit();
 
-            let handler = if !use_cvvdp && !use_butteraugli {
+            let handler = if !use_cvvdp && !use_butter {
                 let mut handler = zeroed::<VshipSSIMU2Handler>();
                 let ret = Vship_SSIMU2Init(from_mut(&mut handler), src_colorspace, dis_colorspace);
                 if ret as i32 != 0 {
@@ -310,7 +369,7 @@ impl VshipProcessor {
                 let mut handler = zeroed::<VshipCVVDPHandler>();
                 let model_key = CString::new(cvvdp_model.unwrap_or("xav"))?;
                 let config_cstr = CString::new(
-                    cvvdp_config.ok_or("CVVDP requires -d/--display <json_file> argument")?,
+                    cvvdp_conf.ok_or("CVVDP requires -d/--display <json_file> argument")?,
                 )?;
                 let ret = Vship_CVVDPInit2(
                     from_mut(&mut handler),
@@ -330,7 +389,7 @@ impl VshipProcessor {
                 None
             };
 
-            let butteraugli_handler = if use_butteraugli {
+            let butter_handler = if use_butter {
                 let mut handler = zeroed::<VshipButteraugliHandler>();
                 let ret = Vship_ButteraugliInit(
                     from_mut(&mut handler),
@@ -351,18 +410,18 @@ impl VshipProcessor {
             Ok(Self {
                 handler,
                 cvvdp_handler,
-                butteraugli_handler,
+                butter_handler,
             })
         }
     }
 
-    pub fn compute_ssimulacra2(
+    pub fn comp_ssimu2(
         &self,
         planes1: [*const u8; 3],
         planes2: [*const u8; 3],
         line_sizes1: [i64; 3],
         line_sizes2: [i64; 3],
-    ) -> Result<f64, Xerr> {
+    ) -> Result<f32, Xerr> {
         unsafe {
             let mut errbuf = MaybeUninit::<[u8; 1024]>::uninit();
             let mut score = 0.0;
@@ -380,7 +439,7 @@ impl VshipProcessor {
                 return Err(vship_err_str(&errbuf));
             }
 
-            Ok(score)
+            Ok(score as f32)
         }
     }
 
@@ -396,13 +455,13 @@ impl VshipProcessor {
         }
     }
 
-    pub fn compute_cvvdp(
+    pub fn comp_cvvdp(
         &self,
         planes1: [*const u8; 3],
         planes2: [*const u8; 3],
         line_sizes1: [i64; 3],
         line_sizes2: [i64; 3],
-    ) -> Result<f64, Xerr> {
+    ) -> Result<f32, Xerr> {
         unsafe {
             let mut errbuf = MaybeUninit::<[u8; 1024]>::uninit();
             let mut score = 0.0;
@@ -422,17 +481,17 @@ impl VshipProcessor {
                 return Err(vship_err_str(&errbuf));
             }
 
-            Ok(score)
+            Ok(score as f32)
         }
     }
 
-    pub fn compute_butteraugli(
+    pub fn comp_butter(
         &self,
         planes1: [*const u8; 3],
         planes2: [*const u8; 3],
         line_sizes1: [i64; 3],
         line_sizes2: [i64; 3],
-    ) -> Result<f64, Xerr> {
+    ) -> Result<f32, Xerr> {
         unsafe {
             let mut errbuf = MaybeUninit::<[u8; 1024]>::uninit();
             let mut score = VshipButteraugliScore {
@@ -441,7 +500,7 @@ impl VshipProcessor {
                 norminf: 0.0,
             };
             let ret = Vship_ComputeButteraugli(
-                self.butteraugli_handler
+                self.butter_handler
                     .ok_or("Butteraugli handler not initialized")?,
                 from_mut(&mut score),
                 null(),
@@ -457,7 +516,7 @@ impl VshipProcessor {
                 return Err(vship_err_str(&errbuf));
             }
 
-            Ok(score.norm_q)
+            Ok(score.norm_q as f32)
         }
     }
 }
@@ -471,7 +530,7 @@ impl Drop for VshipProcessor {
             if let Some(h) = self.cvvdp_handler {
                 Vship_CVVDPFree(h);
             }
-            if let Some(h) = self.butteraugli_handler {
+            if let Some(h) = self.butter_handler {
                 Vship_ButteraugliFree(h);
             }
         }
@@ -480,42 +539,42 @@ impl Drop for VshipProcessor {
 
 fn create_yuv_colorspace(width: u32, height: u32, is_10b: bool, inf: &VidInf) -> VshipColorspace {
     let chroma_loc = match inf.chroma_sample_position {
-        Some(2) => TopLeft,
+        2 => TopLeft,
         _ => Left,
     };
 
     let matrix_val = match inf.matrix_coefficients {
-        Some(0) => Rgb,
-        Some(5) => YmBt470Bg,
-        Some(6) => St170M,
-        Some(9) => Bt2020Ncl,
-        Some(10) => Bt2020Cl,
-        Some(14) => Bt2100Ictcp,
+        0 => Rgb,
+        5 => YmBt470Bg,
+        6 => St170M,
+        9 => Bt2020Ncl,
+        10 => Bt2020Cl,
+        14 => Bt2100Ictcp,
         _ => YmBt709,
     };
 
     let transfer_val = match inf.transfer_characteristics {
-        Some(4) => TrBt470M,
-        Some(5) => TrBt470Bg,
-        Some(6) => Bt601,
-        Some(8) => Linear,
-        Some(13) => Srgb,
-        Some(16) => Pq,
-        Some(17) => St428,
-        Some(18) => Hlg,
+        4 => TrBt470M,
+        5 => TrBt470Bg,
+        6 => Bt601,
+        8 => Linear,
+        13 => Srgb,
+        16 => Pq,
+        17 => St428,
+        18 => Hlg,
         _ => TrBt709,
     };
 
     let primaries_val = match inf.color_primaries {
-        Some(-1) => Internal,
-        Some(4) => PrimBt470M,
-        Some(5) => PrimBt470Bg,
-        Some(9) => Bt2020,
+        -1 => Internal,
+        4 => PrimBt470M,
+        5 => PrimBt470Bg,
+        9 => Bt2020,
         _ => PrimBt709,
     };
 
     let range_val = match inf.color_range {
-        Some(2) => Full,
+        2 => Full,
         _ => Limited,
     };
 

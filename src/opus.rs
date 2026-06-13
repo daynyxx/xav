@@ -47,6 +47,15 @@ unsafe extern "C" {
     fn ope_encoder_destroy(enc: *mut OggOpusEnc);
     fn ope_encoder_ctl(enc: *mut OggOpusEnc, request: c_int, ...) -> c_int;
     fn ope_strerror(error: c_int) -> *const c_char;
+    pub fn ope_get_version_string() -> *const c_char;
+}
+
+pub fn version() -> String {
+    unsafe {
+        CStr::from_ptr(ope_get_version_string())
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 fn check(code: c_int) -> Result<(), Xerr> {
@@ -69,9 +78,8 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    pub fn new(path: &Path, channels: u8, bitrate: u32, family: c_int) -> Result<Self, Xerr> {
-        let path_str = path.to_str().ok_or("invalid audio output path")?;
-        let c_path = CString::new(path_str).map_err(|e| e.to_string())?;
+    pub fn new(path: &Path, channels: u8, brate: u16, family: c_int) -> Result<Self, Xerr> {
+        let c_path = unsafe { CString::new(path.to_str().unwrap_unchecked()).unwrap_unchecked() };
 
         let comments = unsafe { ope_comments_create() };
         if comments.is_null() {
@@ -99,7 +107,7 @@ impl Encoder {
             check(ope_encoder_ctl(
                 ptr,
                 OPUS_SET_BITRATE_REQUEST,
-                bitrate.cast_signed() * 1000,
+                c_int::from(brate) * 1000,
             ))?;
             check(ope_encoder_ctl(ptr, OPUS_SET_VBR_REQUEST, 1i32))?;
             check(ope_encoder_ctl(ptr, OPUS_SET_VBR_CONSTRAINT_REQUEST, 0i32))?;

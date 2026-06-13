@@ -1,14 +1,17 @@
 use std::{
-    arch::is_x86_feature_detected,
-    ffi::CString,
+    ffi::{CStr, CString},
+    mem::size_of,
     path::Path,
     process::{Command, Stdio},
 };
 
 use crate::{
     Encoder::{Avm, SvtAv1, Vvenc, X264, X265},
-    ffms::VidInf,
-    svt::{EbSvtAv1EncConfiguration, svt_av1_enc_parse_parameter},
+    ffms::{VidInf, gcd},
+    svt::{
+        ChromaPoints, ContentLightLevel, EbSvtAv1EncConfiguration, MasteringDisplayInfo,
+        svt_av1_enc_parse_parameter, svt_av1_get_version,
+    },
     util::assume_unreachable,
 };
 
@@ -36,10 +39,44 @@ impl Encoder {
 
     pub const fn extension(self) -> &'static str {
         match self {
-            SvtAv1 | Avm => "ivf",
+            SvtAv1 => "obu",
+            Avm => "ivf",
             Vvenc => "266",
             X265 => "265",
             X264 => "264",
+        }
+    }
+
+    pub const fn codec_id(self) -> &'static [u8] {
+        match self {
+            SvtAv1 => b"V_AV1",
+            Avm => b"V_AV2",
+            Vvenc => b"V_MPEGI/ISO/VVC",
+            X265 => b"V_MPEGH/ISO/HEVC",
+            X264 => b"V_MPEG4/ISO/AVC",
+        }
+    }
+
+    pub const fn codec_name(self) -> &'static [u8] {
+        match self {
+            SvtAv1 => b"Alliance for Open Media AV1 Video codec",
+            Avm => b"Alliance for Open Media AV2 Video codec",
+            Vvenc => b"VVC/H.266",
+            X265 => b"HEVC/H.265",
+            X264 => b"AVC/H.264",
+        }
+    }
+
+    pub fn version(self) -> String {
+        match self {
+            SvtAv1 => {
+                let v = unsafe { CStr::from_ptr(svt_av1_get_version()).to_string_lossy() };
+                format!("SVT-AV1 {}", v.trim_end_matches("-dirty"))
+            }
+            Avm => "AVM".into(),
+            X264 => run_version("x264", "x264", None),
+            X265 => run_version("x265", "x265", Some("version ")),
+            Vvenc => run_version("vvencFFapp", "vvenc", Some("version ")),
         }
     }
 
@@ -48,13 +85,39 @@ impl Encoder {
     }
 }
 
+fn run_version(prog: &str, name: &str, marker: Option<&str>) -> String {
+    let Ok(out) = Command::new(prog).arg("--version").output() else {
+        return name.to_owned();
+    };
+    let mut t = String::from_utf8_lossy(&out.stdout).into_owned();
+    t.push_str(&String::from_utf8_lossy(&out.stderr));
+    marker.map_or_else(
+        || {
+            t.lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or(name)
+                .to_owned()
+        },
+        |m| {
+            t.lines()
+                .find_map(|l| l.split_once(m))
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .map_or_else(|| name.to_owned(), |v| format!("{name} {v}"))
+        },
+    )
+}
+
+pub const SVT_CONF_SIZE: usize = size_of::<EbSvtAv1EncConfiguration>();
+
 pub struct EncConfig<'a> {
     pub inf: &'a VidInf,
+    pub template: Option<&'a [u8]>,
     pub params: &'a str,
     pub zone_params: Option<&'a str>,
-    pub crf: f32,
-    pub output: &'a Path,
-    pub chunk_idx: usize,
+    pub crf: Option<f32>,
+    pub out: &'a Path,
+    pub chnk_idx: u16,
     pub width: u32,
     pub height: u32,
     pub frames: usize,
@@ -82,6 +145,7 @@ fn make_avm_cmd(cfg: &EncConfig) -> Command {
     let fps_str = format!("{}/{}", cfg.inf.fps_num, cfg.inf.fps_den);
 
     cmd.args([
+        "--threads=1",
         "--codec=av2",
         "--profile=0",
         "--usage=0",
@@ -106,12 +170,12 @@ fn make_avm_cmd(cfg: &EncConfig) -> Command {
     cmd.arg(format!("--forced_max_frame_height={height_str}"));
     cmd.arg(format!("--fps={fps_str}"));
     cmd.arg(format!("--limit={}", cfg.frames));
-    cmd.arg(format!("--output={}", cfg.output.display()));
+    cmd.arg(format!("--output={}", cfg.out.display()));
 
     colorize_avm(&mut cmd, cfg.inf);
 
-    if cfg.crf >= 0.0 {
-        cmd.arg(format!("--qp={}", cfg.crf as u32));
+    if let Some(crf) = cfg.crf {
+        cmd.arg(format!("--qp={}", crf as u32));
     }
 
     cmd.args(cfg.params.split_whitespace());
@@ -152,6 +216,8 @@ fn make_vvenc_cmd(cfg: &EncConfig) -> Command {
         "1",
         "--Passes",
         "1",
+        "--Threads",
+        "1",
         "--Profile",
         "main_10",
         "--Tier",
@@ -169,8 +235,8 @@ fn make_vvenc_cmd(cfg: &EncConfig) -> Command {
     cmd.arg("--fps").arg(&fps_str);
     cmd.arg("--FramesToBeEncoded").arg(&frames_str);
 
-    if cfg.crf >= 0.0 {
-        cmd.arg("--QP").arg(format!("{}", cfg.crf as i32));
+    if let Some(crf) = cfg.crf {
+        cmd.arg("--QP").arg(format!("{}", crf as i32));
     }
 
     colorize_vvenc(&mut cmd, cfg.inf);
@@ -178,7 +244,7 @@ fn make_vvenc_cmd(cfg: &EncConfig) -> Command {
     cmd.args(cfg.params.split_whitespace());
 
     cmd.arg("-i").arg("-");
-    cmd.arg("-b").arg(cfg.output);
+    cmd.arg("-b").arg(cfg.out);
 
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -203,14 +269,11 @@ fn make_x265_cmd(cfg: &EncConfig) -> Command {
         "main10",
         "--gop-lookahead",
         "0",
-        "--open-gop",
         "--keyint",
         "-1",
         "--min-keyint",
         "9999",
         "--no-scenecut",
-        "--rc-lookahead",
-        "250",
         "--lookahead-slices",
         "1",
         "--lookahead-threads",
@@ -219,6 +282,7 @@ fn make_x265_cmd(cfg: &EncConfig) -> Command {
         "1",
         "--slices",
         "1",
+        "--no-wpp",
         "--no-info",
         "--no-vui-hrd-info",
         "--no-vui-timing-info",
@@ -230,8 +294,11 @@ fn make_x265_cmd(cfg: &EncConfig) -> Command {
         .arg(format!("{}x{}", cfg.width, cfg.height));
     cmd.arg("--frames").arg(cfg.frames.to_string());
 
-    if cfg.crf >= 0.0 {
-        cmd.arg("--crf").arg(format!("{:.2}", cfg.crf));
+    let (sar_n, sar_d) = h26x_sar(cfg.inf);
+    cmd.arg("--sar").arg(format!("{sar_n}:{sar_d}"));
+
+    if let Some(crf) = cfg.crf {
+        cmd.arg("--crf").arg(format!("{crf:.2}"));
     }
 
     if let Some(preset) = x265_signal_preset(cfg.inf) {
@@ -262,13 +329,11 @@ fn make_x265_cmd(cfg: &EncConfig) -> Command {
         colorize_h26x(&mut cmd, cfg.inf, false);
     }
 
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx512f") {
-        cmd.args(["--asm", "avx512"]);
-    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    cmd.args(["--asm", "avx512"]);
 
     cmd.args(cfg.params.split_whitespace());
-    cmd.arg("--output").arg(cfg.output);
+    cmd.arg("--output").arg(cfg.out);
     cmd.args(["--input", "-"]);
     cmd.stdin(Stdio::piped()).stderr(Stdio::piped());
 
@@ -296,7 +361,6 @@ fn make_x264_cmd(cfg: &EncConfig) -> Command {
         "--min-keyint",
         "9999",
         "--no-scenecut",
-        "--open-gop",
         "--b-adapt",
         "2",
         "--muxer",
@@ -307,6 +371,10 @@ fn make_x264_cmd(cfg: &EncConfig) -> Command {
         "1",
         "--lookahead-threads",
         "1",
+        "--force-cfr",
+        "--non-deterministic",
+        "--nal-hrd",
+        "none",
         "--fps",
     ]);
 
@@ -315,27 +383,39 @@ fn make_x264_cmd(cfg: &EncConfig) -> Command {
         .arg(format!("{}x{}", cfg.width, cfg.height));
     cmd.arg("--frames").arg(cfg.frames.to_string());
 
-    if cfg.crf >= 0.0 {
-        cmd.arg("--crf").arg(format!("{:.2}", cfg.crf));
+    let (sar_n, sar_d) = h26x_sar(cfg.inf);
+    cmd.arg("--sar").arg(format!("{sar_n}:{sar_d}"));
+
+    if let Some(crf) = cfg.crf {
+        cmd.arg("--crf").arg(format!("{crf:.2}"));
     }
 
-    if let Some(cr) = cfg.inf.color_range {
-        cmd.args(["--input-range", if cr == 1 { "pc" } else { "tv" }]);
-    }
+    let cr = cfg.inf.color_range;
+    cmd.args(["--input-range", if cr == 1 { "pc" } else { "tv" }]);
 
     colorize_h26x(&mut cmd, cfg.inf, true);
 
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx512f") {
-        cmd.args(["--asm", "avx512"]);
-    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    cmd.args(["--asm", "avx512"]);
 
     cmd.args(cfg.params.split_whitespace());
-    cmd.arg("--output").arg(cfg.output);
+    cmd.arg("--output").arg(cfg.out);
     cmd.arg("-");
     cmd.stdin(Stdio::piped()).stderr(Stdio::piped());
 
     cmd
+}
+
+fn h26x_sar(inf: &VidInf) -> (u64, u64) {
+    match inf.dar {
+        Some((dw, dh)) => {
+            let n = u64::from(dw) * u64::from(inf.height);
+            let d = u64::from(dh) * u64::from(inf.width);
+            let g = gcd(n, d).max(1);
+            (n / g, d / g)
+        }
+        None => (1, 1),
+    }
 }
 
 fn colorize_h26x(cmd: &mut Command, inf: &VidInf, is_x264: bool) {
@@ -347,25 +427,26 @@ fn colorize_h26x(cmd: &mut Command, inf: &VidInf, is_x264: bool) {
         }
     };
 
-    if let Some(cp) = inf.color_primaries {
-        cmd.args(["--colorprim", unk(h26x_color_primaries_str(cp))]);
+    cmd.args([
+        "--colorprim",
+        unk(h26x_color_prims_str(inf.color_primaries)),
+    ]);
+    cmd.args([
+        "--transfer",
+        unk(h26x_trans_char_str(inf.transfer_characteristics)),
+    ]);
+    cmd.args([
+        "--colormatrix",
+        unk(h26x_matrix_coef_str(inf.matrix_coefficients)),
+    ]);
+    let cr = inf.color_range;
+    if is_x264 {
+        cmd.args(["--range", if cr == 1 { "pc" } else { "tv" }]);
+    } else {
+        cmd.args(["--range", if cr == 1 { "full" } else { "limited" }]);
     }
-    if let Some(tc) = inf.transfer_characteristics {
-        cmd.args(["--transfer", unk(h26x_transfer_char_str(tc))]);
-    }
-    if let Some(mc) = inf.matrix_coefficients {
-        cmd.args(["--colormatrix", unk(h26x_matrix_coeff_str(mc))]);
-    }
-    if let Some(cr) = inf.color_range {
-        if is_x264 {
-            cmd.args(["--range", if cr == 1 { "pc" } else { "tv" }]);
-        } else {
-            cmd.args(["--range", if cr == 1 { "full" } else { "limited" }]);
-        }
-    }
-    if let Some(csp) = inf.chroma_sample_position
-        && (1..=6).contains(&csp)
-    {
+    let csp = inf.chroma_sample_position;
+    if (1..=6).contains(&csp) {
         cmd.args(["--chromaloc", &(csp - 1).to_string()]);
     }
     if let Some(ref md) = inf.mastering_display
@@ -385,12 +466,12 @@ fn colorize_h26x(cmd: &mut Command, inf: &VidInf, is_x264: bool) {
     }
 }
 
-fn x265_signal_preset(inf: &VidInf) -> Option<&'static str> {
+const fn x265_signal_preset(inf: &VidInf) -> Option<&'static str> {
     match (
-        inf.color_primaries?,
-        inf.transfer_characteristics?,
-        inf.matrix_coefficients?,
-        inf.color_range.unwrap_or(0),
+        inf.color_primaries,
+        inf.transfer_characteristics,
+        inf.matrix_coefficients,
+        inf.color_range,
     ) {
         (9, 16, 9, 0) => Some("BT2100_PQ_YCC"),
         (9, 16, 14, 0) => Some("BT2100_PQ_ICTCP"),
@@ -443,21 +524,22 @@ fn x265_color_volume(md: &str) -> Option<&'static str> {
 }
 
 fn colorize_avm(cmd: &mut Command, inf: &VidInf) {
-    if let Some(cp) = inf.color_primaries {
-        cmd.arg(format!("--color-primaries={}", color_primaries_str(cp)));
-    }
-    if let Some(tc) = inf.transfer_characteristics {
-        cmd.arg(format!(
-            "--transfer-characteristics={}",
-            transfer_char_str(tc)
-        ));
-    }
-    if let Some(mc) = inf.matrix_coefficients {
-        cmd.arg(format!("--matrix-coefficients={}", matrix_coeff_str(mc)));
-    }
-    if let Some(csp) = inf.chroma_sample_position {
-        cmd.arg(format!("--chroma-sample-position={}", chroma_pos_str(csp)));
-    }
+    cmd.arg(format!(
+        "--color-primaries={}",
+        color_prims_str(inf.color_primaries)
+    ));
+    cmd.arg(format!(
+        "--transfer-characteristics={}",
+        trans_char_str(inf.transfer_characteristics)
+    ));
+    cmd.arg(format!(
+        "--matrix-coefficients={}",
+        matrix_coef_str(inf.matrix_coefficients)
+    ));
+    cmd.arg(format!(
+        "--chroma-sample-position={}",
+        chroma_pos_str(inf.chroma_sample_position)
+    ));
 }
 
 fn h26x_mastering(md: &str, x264_format: bool) -> Option<String> {
@@ -497,8 +579,8 @@ fn h26x_mastering(md: &str, x264_format: bool) -> Option<String> {
 }
 
 fn colorize_vvenc(cmd: &mut Command, inf: &VidInf) {
-    let tc = inf.transfer_characteristics.unwrap_or(2);
-    let cp = inf.color_primaries.unwrap_or(2);
+    let tc = inf.transfer_characteristics;
+    let cp = inf.color_primaries;
 
     let is_hlg = tc == 18;
     let is_pq = tc == 16;
@@ -523,21 +605,22 @@ fn colorize_vvenc(cmd: &mut Command, inf: &VidInf) {
         cmd.args(["--Sdr", sdr_mode]);
     }
 
-    if let Some(cp) = inf.color_primaries {
-        cmd.args(["--ColourPrimaries", h26x_color_primaries_str(cp)]);
-    }
-    if let Some(tc) = inf.transfer_characteristics {
-        cmd.args(["--TransferCharacteristics", h26x_transfer_char_str(tc)]);
-    }
-    if let Some(mc) = inf.matrix_coefficients {
-        cmd.args(["--MatrixCoefficients", h26x_matrix_coeff_str(mc)]);
-    }
-    if let Some(cr) = inf.color_range {
-        cmd.args(["--Range", if cr == 1 { "full" } else { "limited" }]);
-    }
-    if let Some(csp) = inf.chroma_sample_position
-        && (1..=6).contains(&csp)
-    {
+    cmd.args([
+        "--ColourPrimaries",
+        h26x_color_prims_str(inf.color_primaries),
+    ]);
+    cmd.args([
+        "--TransferCharacteristics",
+        h26x_trans_char_str(inf.transfer_characteristics),
+    ]);
+    cmd.args([
+        "--MatrixCoefficients",
+        h26x_matrix_coef_str(inf.matrix_coefficients),
+    ]);
+    let cr = inf.color_range;
+    cmd.args(["--Range", if cr == 1 { "full" } else { "limited" }]);
+    let csp = inf.chroma_sample_position;
+    if (1..=6).contains(&csp) {
         cmd.args(["--ChromaSampleLocType", &(csp - 1).to_string()]);
     }
     if let Some(ref md) = inf.mastering_display
@@ -550,7 +633,7 @@ fn colorize_vvenc(cmd: &mut Command, inf: &VidInf) {
     }
 }
 
-const fn h26x_color_primaries_str(v: i32) -> &'static str {
+const fn h26x_color_prims_str(v: i8) -> &'static str {
     match v {
         1 => "bt709",
         4 => "bt470m",
@@ -566,7 +649,7 @@ const fn h26x_color_primaries_str(v: i32) -> &'static str {
     }
 }
 
-const fn h26x_transfer_char_str(v: i32) -> &'static str {
+const fn h26x_trans_char_str(v: i8) -> &'static str {
     match v {
         1 => "bt709",
         4 => "bt470m",
@@ -588,7 +671,7 @@ const fn h26x_transfer_char_str(v: i32) -> &'static str {
     }
 }
 
-const fn h26x_matrix_coeff_str(v: i32) -> &'static str {
+const fn h26x_matrix_coef_str(v: i8) -> &'static str {
     match v {
         0 => "gbr",
         1 => "bt709",
@@ -607,7 +690,7 @@ const fn h26x_matrix_coeff_str(v: i32) -> &'static str {
     }
 }
 
-const fn color_primaries_str(v: i32) -> &'static str {
+const fn color_prims_str(v: i8) -> &'static str {
     match v {
         1 => "bt709",
         4 => "bt470m",
@@ -624,7 +707,7 @@ const fn color_primaries_str(v: i32) -> &'static str {
     }
 }
 
-const fn transfer_char_str(v: i32) -> &'static str {
+const fn trans_char_str(v: i8) -> &'static str {
     match v {
         1 => "bt709",
         4 => "bt470m",
@@ -646,7 +729,7 @@ const fn transfer_char_str(v: i32) -> &'static str {
     }
 }
 
-const fn matrix_coeff_str(v: i32) -> &'static str {
+const fn matrix_coef_str(v: i8) -> &'static str {
     match v {
         0 => "identity",
         1 => "bt709",
@@ -665,85 +748,83 @@ const fn matrix_coeff_str(v: i32) -> &'static str {
     }
 }
 
-fn parse_svt_param(config: *mut EbSvtAv1EncConfiguration, name: &str, value: &str) {
+fn parse_svt_param(conf: *mut EbSvtAv1EncConfiguration, name: &str, value: &str) {
     let Ok(n) = CString::new(name) else {
         return;
     };
     let Ok(v) = CString::new(value) else {
         return;
     };
-    unsafe { svt_av1_enc_parse_parameter(config, n.as_ptr(), v.as_ptr()) };
+    unsafe { svt_av1_enc_parse_parameter(conf, n.as_ptr(), v.as_ptr()) };
 }
 
-fn parse_svt_params(config: *mut EbSvtAv1EncConfiguration, params: &str) {
+fn parse_svt_params(conf: *mut EbSvtAv1EncConfiguration, params: &str) {
     let mut iter = params.split_whitespace();
     while let Some(key) = iter.next() {
         if let Some(name) = key.strip_prefix("--")
             && let Some(val) = iter.next()
         {
-            parse_svt_param(config, name, val);
+            parse_svt_param(conf, name, val);
         }
     }
 }
 
-pub fn set_svt_config(config: *mut EbSvtAv1EncConfiguration, cfg: &EncConfig) {
-    let w = cfg.width.to_string();
-    let h = cfg.height.to_string();
-
-    for (name, value) in [
-        ("input-depth", "10"),
-        ("color-format", "1"),
-        ("profile", "0"),
-        ("tile-rows", "0"),
-        ("tile-columns", "0"),
-        ("keyint", "0"),
-        ("rc", "0"),
-        ("scd", "0"),
-    ] {
-        parse_svt_param(config, name, value);
+pub fn set_svt_base(
+    conf: *mut EbSvtAv1EncConfiguration,
+    inf: &VidInf,
+    params: &str,
+    width: u32,
+    height: u32,
+) {
+    unsafe {
+        (*conf).intra_period_length = -1;
+        (*conf).source_width = width;
+        (*conf).source_height = height;
+        (*conf).scene_change_detection = 0;
+        (*conf).encoder_bit_depth = 10;
+        (*conf).encoder_color_format = 1;
+        (*conf).profile = 0;
+        (*conf).rate_control_mode = 0;
+        (*conf).frame_rate_numerator = inf.fps_num;
+        (*conf).frame_rate_denominator = inf.fps_den;
+        (*conf).color_primaries = i32::from(inf.color_primaries);
+        (*conf).transfer_characteristics = i32::from(inf.transfer_characteristics);
+        (*conf).matrix_coefficients = i32::from(inf.matrix_coefficients);
+        (*conf).color_range = i32::from(inf.color_range);
+        (*conf).chroma_sample_position = i32::from(inf.chroma_sample_position);
+        if let Some(m) = inf.mastering {
+            let q = |v: f64| ((v * 65536.0).round().min(65535.0) as u16).to_be();
+            let cp = |(x, y): (f64, f64)| ChromaPoints { x: q(x), y: q(y) };
+            (*conf).mastering_display = MasteringDisplayInfo {
+                r: cp(m.r),
+                g: cp(m.g),
+                b: cp(m.b),
+                white_point: cp(m.wp),
+                max_luma: ((m.lum_max * 256.0).round() as u32).to_be(),
+                min_luma: ((m.lum_min * 16384.0).round() as u32).to_be(),
+            };
+        }
+        if let Some((c, f)) = inf.content_light_level {
+            (*conf).content_light_level = ContentLightLevel {
+                max_cll: c.to_be(),
+                max_fall: f.to_be(),
+            };
+        }
     }
 
-    parse_svt_param(config, "width", &w);
-    parse_svt_param(config, "forced-max-frame-width", &w);
-    parse_svt_param(config, "height", &h);
-    parse_svt_param(config, "forced-max-frame-height", &h);
-    parse_svt_param(config, "fps-num", &cfg.inf.fps_num.to_string());
-    parse_svt_param(config, "fps-denom", &cfg.inf.fps_den.to_string());
+    parse_svt_params(conf, params);
+}
 
-    if cfg.crf >= 0.0 {
-        parse_svt_param(config, "crf", &format!("{:.2}", cfg.crf));
+pub fn set_svt_chunk(conf: *mut EbSvtAv1EncConfiguration, cfg: &EncConfig) {
+    if let Some(crf) = cfg.crf {
+        parse_svt_param(conf, "crf", &format!("{crf:.2}"));
     }
-
-    if let Some(cp) = cfg.inf.color_primaries {
-        parse_svt_param(config, "color-primaries", &cp.to_string());
-    }
-    if let Some(tc) = cfg.inf.transfer_characteristics {
-        parse_svt_param(config, "transfer-characteristics", &tc.to_string());
-    }
-    if let Some(mc) = cfg.inf.matrix_coefficients {
-        parse_svt_param(config, "matrix-coefficients", &mc.to_string());
-    }
-    if let Some(cr) = cfg.inf.color_range {
-        parse_svt_param(config, "color-range", &cr.to_string());
-    }
-    if let Some(csp) = cfg.inf.chroma_sample_position {
-        parse_svt_param(config, "chroma-sample-position", &csp.to_string());
-    }
-    if let Some(ref md) = cfg.inf.mastering_display {
-        parse_svt_param(config, "mastering-display", md);
-    }
-    if let Some(ref cl) = cfg.inf.content_light {
-        parse_svt_param(config, "content-light", cl);
-    }
-
-    parse_svt_params(config, cfg.params);
-
     if let Some(z) = cfg.zone_params {
-        parse_svt_params(config, z);
+        parse_svt_params(conf, z);
     }
 }
 
-const fn chroma_pos_str(v: i32) -> &'static str {
+const fn chroma_pos_str(v: i8) -> &'static str {
     match v {
         1 => "left",
         2 => "center",

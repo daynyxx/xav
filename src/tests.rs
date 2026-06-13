@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     env,
-    fs::{self, File},
+    fs::{File, metadata, remove_file},
     io::{BufWriter, Write},
     mem::{size_of, zeroed},
     path::{Path, PathBuf},
@@ -12,26 +12,20 @@ use std::{
         Arc, Once,
         atomic::{AtomicUsize, Ordering::Relaxed},
     },
-    thread,
+    thread::{available_parallelism, scope, spawn},
 };
 
 use crossbeam_channel::bounded;
 
-#[cfg(all(target_feature = "avx2", not(target_feature = "avx512bw")))]
-use crate::avx2::{PACK_CHUNK, SHIFT_CHUNK, UNPACK_CHUNK};
-#[cfg(target_feature = "avx512bw")]
-use crate::avx512::{PACK_CHUNK, SHIFT_CHUNK, UNPACK_CHUNK};
-#[cfg(not(any(target_feature = "avx2", target_feature = "avx512bw")))]
-use crate::scalar::{PACK_CHUNK, SHIFT_CHUNK, UNPACK_CHUNK};
 #[cfg(feature = "vship")]
 use crate::vship::{VshipProcessor, init_device};
 use crate::{
-    chunk::{chunkify, load_scenes},
-    decode::decode_chunks,
-    encode::get_frame,
-    encoder::{EncConfig, set_svt_config},
-    ffms::{self, DecodeStrat, VidInf, VideoDecoder, get_vidinf},
-    pack::{calc_8b_size, calc_packed_size},
+    chunk::{chnkify, load_scenes},
+    dec::dec_chnks,
+    enc::get_frame,
+    encoder::{EncConfig, set_svt_base, set_svt_chunk},
+    ffms::{DecStrat, VidDecoder, VidInf, get_dec_strat, get_vidinf},
+    pack::{PACK_CHUNK, SHIFT_CHUNK, UNPACK_CHUNK, calc_8b_sz, calc_packed_sz},
     pipeline::{
         Pipeline, UnpackFn, WriteFn, write_frames_8b, write_frames_8b_rem, write_frames_10b,
     },
@@ -53,7 +47,7 @@ macro_rules! sw {
     ($name:ident, $file:expr, $crop:expr, $buf:literal, $strat:pat) => {
         #[test]
         fn $name() {
-            use DecodeStrat::*;
+            use DecStrat::*;
             let strat = run_test($file, $crop, false, false, $buf, false);
             assert!(
                 matches!(strat, $strat),
@@ -68,7 +62,7 @@ macro_rules! hw {
     ($name:ident, $file:expr, $crop:expr, $tq:literal, $buf:literal, $strat:pat) => {
         #[test]
         fn $name() {
-            use DecodeStrat::*;
+            use DecStrat::*;
             let strat = run_test($file, $crop, true, $tq, $buf, false);
             assert!(
                 matches!(strat, $strat),
@@ -104,14 +98,15 @@ fn write_ivf_header(out: &mut impl Write, w: u32, h: u32, fps_num: u32, fps_den:
 
 fn svt_init(cfg: &EncConfig) -> *mut EbComponentType {
     let mut handle: *mut EbComponentType = null_mut();
-    let mut config = unsafe { zeroed::<EbSvtAv1EncConfiguration>() };
+    let mut conf = unsafe { zeroed::<EbSvtAv1EncConfiguration>() };
     assert_eq!(
-        unsafe { svt_av1_enc_init_handle(&raw mut handle, &raw mut config) },
+        unsafe { svt_av1_enc_init_handle(&raw mut handle, &raw mut conf) },
         EB_ERROR_NONE
     );
-    set_svt_config(&raw mut config, cfg);
+    set_svt_base(&raw mut conf, cfg.inf, cfg.params, cfg.width, cfg.height);
+    set_svt_chunk(&raw mut conf, cfg);
     assert_eq!(
-        unsafe { svt_av1_enc_set_parameter(handle, &raw mut config) },
+        unsafe { svt_av1_enc_set_parameter(handle, &raw mut conf) },
         EB_ERROR_NONE
     );
     assert_eq!(unsafe { svt_av1_enc_init(handle) }, EB_ERROR_NONE);
@@ -140,9 +135,9 @@ fn svt_drain(handle: *mut EbComponentType, out: &mut impl Write, done: bool) {
     }
 }
 
-fn ffmpeg_reference(input: &Path, w: usize, h: usize, crop: (u32, u32)) -> Vec<u8> {
+fn ffmpeg_reference(inp: &Path, w: usize, h: usize, crop: (u32, u32)) -> Vec<u8> {
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-i", input.to_str().unwrap()]);
+    cmd.args(["-i", inp.to_str().unwrap()]);
     if crop != (0, 0) {
         cmd.args(["-vf", &format!("crop={}:{}:{}:{}", w, h, crop.1, crop.0)]);
     }
@@ -156,17 +151,14 @@ fn ffmpeg_reference(input: &Path, w: usize, h: usize, crop: (u32, u32)) -> Vec<u
         "pipe:1",
     ]);
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-    let output = cmd.output().unwrap();
-    assert!(
-        output.status.success(),
-        "ffmpeg reference extraction failed"
-    );
-    output.stdout
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "ffmpeg reference extraction failed");
+    out.stdout
 }
 
-fn prod_convert(all_yuv: &[u8], pipe: &Pipeline, frame_count: usize) -> Vec<u8> {
-    if pipe.conv_buf_size == 0 {
-        return all_yuv[..frame_count * pipe.frame_size].to_vec();
+fn prod_convert(all_yuv: &[u8], pipe: &Pipeline, frame_cnt: usize) -> Vec<u8> {
+    if pipe.conv_buf_sz == 0 {
+        return all_yuv[..frame_cnt * pipe.frame_sz].to_vec();
     }
     let mut child = Command::new("cat")
         .stdin(Stdio::piped())
@@ -175,38 +167,39 @@ fn prod_convert(all_yuv: &[u8], pipe: &Pipeline, frame_count: usize) -> Vec<u8> 
         .spawn()
         .unwrap();
     let stdin = child.stdin.take().unwrap();
-    thread::scope(|s| {
+    scope(|s| {
         s.spawn(move || {
             let mut stdin = stdin;
-            let mut buf = vec![0u8; pipe.conv_buf_size];
-            (pipe.write_frames)(&mut stdin, all_yuv, frame_count, &mut buf, pipe);
+            let mut buf = vec![0u8; pipe.conv_buf_sz];
+            (pipe.write_frames)(&mut stdin, all_yuv, frame_cnt, &mut buf, pipe);
         });
         child.wait_with_output().unwrap().stdout
     })
 }
 
-fn svt_encode(converted: &[u8], pipe: &Pipeline, inf: &VidInf, frame_count: usize, output: &Path) {
+fn svt_enc(converted: &[u8], pipe: &Pipeline, inf: &VidInf, frame_cnt: usize, out: &Path) {
     let w = pipe.final_w;
     let h = pipe.final_h;
-    let y_size = w * h * 2;
-    let uv_size = (w / 2) * (h / 2) * 2;
-    let enc_frame_size = y_size + uv_size * 2;
+    let y_sz = w * h * 2;
+    let uv_sz = (w / 2) * (h / 2) * 2;
+    let enc_frame_sz = y_sz + uv_sz * 2;
 
     let cfg = EncConfig {
         inf,
+        template: None,
         params: "--preset 7 --lp 5 --scm 0",
         zone_params: None,
-        crf: 20.0,
-        output,
-        chunk_idx: 0,
+        crf: Some(20.0),
+        out,
+        chnk_idx: 0,
         width: w as u32,
         height: h as u32,
-        frames: frame_count,
+        frames: frame_cnt,
     };
     let handle = svt_init(&cfg);
 
-    let mut out = BufWriter::new(File::create(output).unwrap());
-    write_ivf_header(&mut out, cfg.width, cfg.height, inf.fps_num, inf.fps_den);
+    let mut writer = BufWriter::new(File::create(out).unwrap());
+    write_ivf_header(&mut writer, cfg.width, cfg.height, inf.fps_num, inf.fps_den);
 
     let mut io_fmt = EbSvtIOFormat {
         luma: null_mut(),
@@ -221,15 +214,15 @@ fn svt_encode(converted: &[u8], pipe: &Pipeline, inf: &VidInf, frame_count: usiz
     let mut in_hdr = unsafe { zeroed::<EbBufferHeaderType>() };
     in_hdr.size = size_of::<EbBufferHeaderType>() as u32;
     in_hdr.p_buffer = io_ptr.cast::<u8>();
-    in_hdr.n_filled_len = enc_frame_size as u32;
+    in_hdr.n_filled_len = enc_frame_sz as u32;
     in_hdr.n_alloc_len = in_hdr.n_filled_len;
 
-    for i in 0..frame_count {
-        let off = i * enc_frame_size;
+    for i in 0..frame_cnt {
+        let off = i * enc_frame_sz;
         unsafe {
             (*io_ptr).luma = converted[off..].as_ptr().cast_mut();
-            (*io_ptr).cb = converted[off + y_size..].as_ptr().cast_mut();
-            (*io_ptr).cr = converted[off + y_size + uv_size..].as_ptr().cast_mut();
+            (*io_ptr).cb = converted[off + y_sz..].as_ptr().cast_mut();
+            (*io_ptr).cr = converted[off + y_sz + uv_sz..].as_ptr().cast_mut();
         }
 
         in_hdr.pts = i as i64;
@@ -238,22 +231,22 @@ fn svt_encode(converted: &[u8], pipe: &Pipeline, inf: &VidInf, frame_count: usiz
             unsafe { svt_av1_enc_send_picture(handle, &raw mut in_hdr) },
             EB_ERROR_NONE
         );
-        svt_drain(handle, &mut out, false);
+        svt_drain(handle, &mut writer, false);
     }
 
     let mut eos = unsafe { zeroed::<EbBufferHeaderType>() };
     eos.flags = EB_BUFFERFLAG_EOS;
     unsafe { svt_av1_enc_send_picture(handle, &raw mut eos) };
-    svt_drain(handle, &mut out, true);
+    svt_drain(handle, &mut writer, true);
 
-    drop(out);
+    drop(writer);
     unsafe {
         svt_av1_enc_deinit(handle);
         svt_av1_enc_deinit_handle(handle);
     }
 }
 
-fn verify_pixels(reference: &[u8], production: &[u8], pipe: &Pipeline) {
+fn verify_pix(reference: &[u8], production: &[u8], pipe: &Pipeline) {
     assert_eq!(
         reference.len(),
         production.len(),
@@ -290,36 +283,42 @@ fn verify_pixels(reference: &[u8], production: &[u8], pipe: &Pipeline) {
     }
 }
 
-fn verify_dispatch(strat: DecodeStrat, pipe: &Pipeline, inf: &VidInf, tq_mode: bool) {
-    use DecodeStrat::*;
+fn verify_dispatch(strat: DecStrat, pipe: &Pipeline, inf: &VidInf, tq_mode: bool) {
+    use DecStrat::*;
 
-    use crate::{encode::test_access as enc_ta, pipeline::test_access as pipe_ta};
+    use crate::{
+        enc::test_access::{
+            enc_svt_direct_addr, enc_svt_drop_addr, enc_svt_drop_rem_addr, enc_svt_nv12_drop_addr,
+            enc_svt_nv12_drop_rem_addr, resolve_svt_enc_addr,
+        },
+        pipeline::test_access::{NV12_10B, NV12_10B_REM, UNPACK_10B, UNPACK_10B_REM, UNPACK_NOOP},
+    };
 
     let name = format!("{strat:?}");
-    let is_nv12_to_10 = matches!(strat, HwNv12To10 | HwNv12To10Stride | HwNv12CropTo10 { .. });
+    let is_nv12_10 = matches!(strat, HwNv12To10 | HwNv12To10Stride | HwNv12CropTo10 { .. });
 
-    let (exp_unpack, exp_write): (UnpackFn, WriteFn) = if is_nv12_to_10 {
+    let (exp_unpack, exp_write): (UnpackFn, WriteFn) = if is_nv12_10 {
         let y_ok = (pipe.final_w * pipe.final_h).is_multiple_of(SHIFT_CHUNK);
         let uv_ok = (pipe.final_w / 2 * (pipe.final_h / 2)).is_multiple_of(SHIFT_CHUNK * 2);
         if y_ok && uv_ok {
-            (pipe_ta::NV12_TO_10B, write_frames_10b)
+            (NV12_10B, write_frames_10b)
         } else {
-            (pipe_ta::NV12_TO_10B_REM, write_frames_10b)
+            (NV12_10B_REM, write_frames_10b)
         }
     } else if strat.is_raw() {
-        (pipe_ta::UNPACK_NOOP, write_frames_10b)
+        (UNPACK_NOOP, write_frames_10b)
     } else if !inf.is_10b {
-        if pipe.frame_size.is_multiple_of(SHIFT_CHUNK) {
-            (pipe_ta::UNPACK_NOOP, write_frames_8b)
+        if pipe.frame_sz.is_multiple_of(SHIFT_CHUNK) {
+            (UNPACK_NOOP, write_frames_8b)
         } else {
-            (pipe_ta::UNPACK_NOOP, write_frames_8b_rem)
+            (UNPACK_NOOP, write_frames_8b_rem)
         }
     } else if !pipe.final_w.is_multiple_of(PACK_CHUNK)
-        || !pipe.frame_size.is_multiple_of(UNPACK_CHUNK)
+        || !pipe.frame_sz.is_multiple_of(UNPACK_CHUNK)
     {
-        (pipe_ta::UNPACK_10B_REM, write_frames_10b)
+        (UNPACK_10B_REM, write_frames_10b)
     } else {
-        (pipe_ta::UNPACK_10B, write_frames_10b)
+        (UNPACK_10B, write_frames_10b)
     };
     assert!(
         fn_addr_eq(pipe.unpack, exp_unpack),
@@ -331,21 +330,21 @@ fn verify_dispatch(strat: DecodeStrat, pipe: &Pipeline, inf: &VidInf, tq_mode: b
     );
 
     if !tq_mode {
-        let actual_enc = enc_ta::resolve_svt_enc_addr(strat, is_nv12_to_10, inf, pipe);
+        let actual_enc = resolve_svt_enc_addr(strat, is_nv12_10, inf, pipe);
         let expected_enc = if strat.is_raw() {
-            enc_ta::enc_svt_direct_addr()
-        } else if is_nv12_to_10 {
+            enc_svt_direct_addr()
+        } else if is_nv12_10 {
             let y_ok = (pipe.final_w * pipe.final_h).is_multiple_of(SHIFT_CHUNK);
             let uv_ok = (pipe.final_w / 2 * (pipe.final_h / 2)).is_multiple_of(SHIFT_CHUNK * 2);
             if y_ok && uv_ok {
-                enc_ta::enc_svt_nv12_drop_addr()
+                enc_svt_nv12_drop_addr()
             } else {
-                enc_ta::enc_svt_nv12_drop_rem_addr()
+                enc_svt_nv12_drop_rem_addr()
             }
-        } else if !inf.is_10b && !pipe.frame_size.is_multiple_of(SHIFT_CHUNK) {
-            enc_ta::enc_svt_drop_rem_addr()
+        } else if !inf.is_10b && !pipe.frame_sz.is_multiple_of(SHIFT_CHUNK) {
+            enc_svt_drop_rem_addr()
         } else {
-            enc_ta::enc_svt_drop_addr()
+            enc_svt_drop_addr()
         };
         assert_eq!(actual_enc, expected_enc, "wrong SVT encode fn for {name}");
     }
@@ -353,28 +352,28 @@ fn verify_dispatch(strat: DecodeStrat, pipe: &Pipeline, inf: &VidInf, tq_mode: b
     #[cfg(feature = "vship")]
     if tq_mode {
         use crate::{
-            pipeline::CalcMetricsFn,
-            tq::{calc_metrics_8b, calc_metrics_10b},
+            pipeline::{CalcMetricFn, test_access::COMPUTE_CVVDP},
+            tq::{calc_metric_8b, calc_metric_10b},
         };
 
         assert!(
-            fn_addr_eq(pipe.compute_metric, pipe_ta::COMPUTE_CVVDP),
+            fn_addr_eq(pipe.compute_metric, COMPUTE_CVVDP),
             "wrong compute_metric for {name}"
         );
 
-        let expected_calc: CalcMetricsFn = if inf.is_10b {
-            calc_metrics_10b
+        let expected_calc: CalcMetricFn = if inf.is_10b {
+            calc_metric_10b
         } else {
-            calc_metrics_8b
+            calc_metric_8b
         };
         assert!(
-            fn_addr_eq(pipe.calc_metrics, expected_calc),
-            "wrong calc_metrics fn for {name}"
+            fn_addr_eq(pipe.calc_metric, expected_calc),
+            "wrong calc_metric fn for {name}"
         );
     }
 }
 
-fn verify_pipeline(pipe: &Pipeline, inf: &VidInf, crop: (u32, u32), strat: DecodeStrat) {
+fn verify_pipeline(pipe: &Pipeline, inf: &VidInf, crop: (u32, u32), strat: DecStrat) {
     let has_crop = crop != (0, 0);
     let (expected_w, expected_h) = if has_crop {
         (
@@ -390,45 +389,45 @@ fn verify_pipeline(pipe: &Pipeline, inf: &VidInf, crop: (u32, u32), strat: Decod
 
     if strat.is_raw() {
         assert_eq!(
-            pipe.frame_size,
+            pipe.frame_sz,
             expected_w * expected_h * 3,
             "raw frame_size mismatch"
         );
-        assert_eq!(pipe.conv_buf_size, 0, "raw conv_buf_size should be 0");
+        assert_eq!(pipe.conv_buf_sz, 0, "raw conv_buf_size should be 0");
     } else if inf.is_10b {
         assert_eq!(
-            pipe.frame_size,
-            calc_packed_size(expected_w as u32, expected_h as u32),
+            pipe.frame_sz,
+            calc_packed_sz(expected_w as u32, expected_h as u32),
             "packed frame_size mismatch"
         );
     } else {
         assert_eq!(
-            pipe.frame_size,
-            calc_8b_size(expected_w as u32, expected_h as u32),
+            pipe.frame_sz,
+            calc_8b_sz(expected_w as u32, expected_h as u32),
             "8b frame_size mismatch"
         );
     }
 
-    let pixel_size = if inf.is_10b { 2 } else { 1 };
+    let pix_sz = if inf.is_10b { 2 } else { 1 };
     assert_eq!(
-        pipe.y_size,
-        expected_w * expected_h * pixel_size,
+        pipe.y_sz,
+        expected_w * expected_h * pix_sz,
         "y_size mismatch"
     );
-    assert_eq!(pipe.uv_size, pipe.y_size / 4, "uv_size mismatch");
+    assert_eq!(pipe.uv_sz, pipe.y_sz / 4, "uv_size mismatch");
 }
 
 #[cfg(feature = "vship")]
-fn validate_tq(
+fn val_tq(
     all_yuv: &[u8],
     pipe: &Pipeline,
     inf: &VidInf,
-    total_frames: usize,
+    tot_frames: usize,
     ivf: &Path,
     filename: &str,
 ) {
     let display_json = test_path("display.json");
-    let config_str = display_json.to_str().expect("non-UTF8 path");
+    let conf_str = display_json.to_str().expect("non-UTF8 path");
 
     INIT_DEVICE.call_once(|| init_device().unwrap());
 
@@ -439,38 +438,38 @@ fn validate_tq(
         true,
         false,
         Some("xav"),
-        Some(config_str),
+        Some(conf_str),
     )
     .unwrap();
     vship.reset_cvvdp();
 
-    let threads = thread::available_parallelism().map_or(1, |n| n.get() as i32);
-    let mut probe_dec = VideoDecoder::new(ivf, threads).unwrap();
+    let threads = available_parallelism().map_or(1, |n| n.get() as i32);
+    let mut probe_dec = VidDecoder::new(ivf, threads).unwrap();
 
-    let pixel_size = if inf.is_10b { 2 } else { 1 };
-    let y_sz = pipe.final_w * pipe.final_h * pixel_size;
+    let pix_sz = if inf.is_10b { 2 } else { 1 };
+    let y_sz = pipe.final_w * pipe.final_h * pix_sz;
     let uv_sz = y_sz / 4;
-    let ys = (pipe.final_w * pixel_size) as i64;
-    let cs = (pipe.final_w / 2 * pixel_size) as i64;
+    let ys = (pipe.final_w * pix_sz) as i64;
+    let cs = (pipe.final_w / 2 * pix_sz) as i64;
 
-    let mut unpacked_buf = vec![0u8; pipe.conv_buf_size];
+    let mut unpacked_buf = vec![0u8; pipe.conv_buf_sz];
     let mut last_score = 0.0;
 
-    for i in 0..total_frames {
-        let input_frame = get_frame(all_yuv, i, pipe.frame_size);
-        let of = probe_dec.decode_next();
+    for i in 0..tot_frames {
+        let inp_frame = get_frame(all_yuv, i, pipe.frame_sz);
+        let of = probe_dec.dec_next();
 
-        let input_yuv: &[u8] = if inf.is_10b {
-            (pipe.unpack)(input_frame, &mut unpacked_buf, pipe);
+        let inp_yuv: &[u8] = if inf.is_10b {
+            (pipe.unpack)(inp_frame, &mut unpacked_buf, pipe);
             &unpacked_buf
         } else {
-            input_frame
+            inp_frame
         };
 
-        let input_planes = [
-            input_yuv.as_ptr(),
-            input_yuv[y_sz..].as_ptr(),
-            input_yuv[y_sz + uv_sz..].as_ptr(),
+        let inp_planes = [
+            inp_yuv.as_ptr(),
+            inp_yuv[y_sz..].as_ptr(),
+            inp_yuv[y_sz + uv_sz..].as_ptr(),
         ];
 
         let of = unsafe { &*of };
@@ -487,7 +486,7 @@ fn validate_tq(
 
         last_score = (pipe.compute_metric)(
             &vship,
-            input_planes,
+            inp_planes,
             output_planes,
             [ys, cs, cs],
             output_strides,
@@ -503,19 +502,19 @@ fn validate_tq(
 fn run_test(
     filename: &str,
     crop: (u32, u32),
-    hwaccel: bool,
+    hwdec: bool,
     tq: bool,
     buffer: usize,
     tq_mode: bool,
-) -> DecodeStrat {
-    let input = test_path(filename);
-    let mut inf = get_vidinf(&input).unwrap();
-    if hwaccel {
-        let mut dec = VideoDecoder::new_hw(&input, 1).unwrap();
-        inf.y_linesize = unsafe { (*dec.decode_next()).linesize[0] as usize };
+) -> DecStrat {
+    let inp = test_path(filename);
+    let mut inf = get_vidinf(&inp).unwrap();
+    if hwdec {
+        let mut dec = VidDecoder::new_hw(&inp, 1).unwrap();
+        inf.y_linesz = unsafe { (*dec.dec_next()).linesize[0] as usize };
     }
 
-    let mut strat = ffms::get_decode_strat(&inf, crop, hwaccel, tq);
+    let mut strat = get_dec_strat(&inf, crop, hwdec, tq);
     if buffer == 0 {
         strat = strat.to_raw();
     }
@@ -532,56 +531,56 @@ fn run_test(
 
     let scenes_path = test_path("scenes.txt");
     let scenes = load_scenes(&scenes_path, inf.frames).unwrap();
-    let chunks = chunkify(&scenes);
+    let chnks = chnkify(&scenes);
 
     let (tx, rx) = bounded::<WorkPkg>(1);
     let sem = Arc::new(Semaphore::new(1));
-    let handle = thread::spawn({
-        let input = input.clone();
+    let handle = spawn({
+        let inp = inp.clone();
         let inf = inf.clone();
         let sem = Arc::clone(&sem);
         move || {
-            decode_chunks(&chunks, &input, &inf, &tx, &HashSet::new(), strat, &sem);
+            dec_chnks(&chnks, &inp, &inf, &tx, &HashSet::new(), strat, &sem);
         }
     });
 
     let mut all_yuv = Vec::new();
-    let mut total_frames = 0usize;
+    let mut tot_frames = 0usize;
     while let Ok(pkg) = rx.recv() {
-        total_frames += pkg.frame_count;
+        tot_frames += pkg.frame_cnt;
         all_yuv.extend_from_slice(&pkg.yuv);
         sem.release();
     }
     handle.join().unwrap();
 
-    assert!(total_frames > 0);
-    assert_eq!(all_yuv.len(), total_frames * pipe.frame_size);
+    assert!(tot_frames > 0);
+    assert_eq!(all_yuv.len(), tot_frames * pipe.frame_sz);
 
-    let converted = prod_convert(&all_yuv, &pipe, total_frames);
-    let reference = ffmpeg_reference(&input, pipe.final_w, pipe.final_h, crop);
-    let enc_frame_size = pipe.final_w * pipe.final_h * 3;
-    verify_pixels(&reference, &converted[..enc_frame_size], &pipe);
+    let converted = prod_convert(&all_yuv, &pipe, tot_frames);
+    let reference = ffmpeg_reference(&inp, pipe.final_w, pipe.final_h, crop);
+    let enc_frame_sz = pipe.final_w * pipe.final_h * 3;
+    verify_pix(&reference, &converted[..enc_frame_sz], &pipe);
 
     let ivf = temp_ivf();
-    svt_encode(&converted, &pipe, &inf, total_frames, &ivf);
-    let ivf_size = fs::metadata(&ivf).map_or(0, |m| m.len());
-    assert!(ivf_size > 32, "IVF file too small: {ivf_size}");
+    svt_enc(&converted, &pipe, &inf, tot_frames, &ivf);
+    let ivf_sz = metadata(&ivf).map_or(0, |m| m.len());
+    assert!(ivf_sz > 32, "IVF file too small: {ivf_sz}");
 
     #[cfg(feature = "vship")]
     if tq_mode {
-        validate_tq(&all_yuv, &pipe, &inf, total_frames, &ivf, filename);
+        val_tq(&all_yuv, &pipe, &inf, tot_frames, &ivf, filename);
     }
     #[cfg(not(feature = "vship"))]
     let _ = tq_mode;
 
-    _ = fs::remove_file(&ivf);
+    _ = remove_file(&ivf);
     strat
 }
 
 #[test]
 fn strat_coverage() {
-    use DecodeStrat::*;
-    fn _exhaustive(s: DecodeStrat) {
+    use DecStrat::*;
+    fn _exhaustive(s: DecStrat) {
         match s {
             B10Fast
             | B10FastRem
@@ -983,7 +982,7 @@ mod tq {
         ($name:ident, $file:expr, $crop:expr, $strat:pat) => {
             #[test]
             fn $name() {
-                use DecodeStrat::*;
+                use DecStrat::*;
                 let strat = run_test($file, $crop, false, false, 1, true);
                 assert!(
                     matches!(strat, $strat),
@@ -998,7 +997,7 @@ mod tq {
         ($name:ident, $file:expr, $crop:expr, $tq:literal, $strat:pat) => {
             #[test]
             fn $name() {
-                use DecodeStrat::*;
+                use DecStrat::*;
                 let strat = run_test($file, $crop, true, $tq, 1, true);
                 assert!(
                     matches!(strat, $strat),

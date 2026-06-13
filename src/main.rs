@@ -1,10 +1,9 @@
-#[cfg(feature = "vship")]
-use std::sync::OnceLock;
 use std::{
     collections::hash_map::DefaultHasher,
     env::args as env_args,
     fs::{
-        create_dir_all, metadata, read_to_string, remove_dir_all, remove_file, write as write_to,
+        create_dir_all, read_to_string as read_to_str, remove_dir_all as rm_dir_all,
+        remove_file as rm_file, write as write_to,
     },
     hash::{Hash as _, Hasher as _},
     io::{Write as _, stdout},
@@ -13,66 +12,71 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::Ordering::Relaxed,
     thread::{JoinHandle, available_parallelism, spawn},
-    time::{Duration, Instant},
+    time::{Duration as Durat, Instant},
 };
 
 use libc::{_exit, SIGINT, SIGSEGV, atexit, signal};
 
 use crate::{
-    encoder::Encoder::{Avm, SvtAv1, Vvenc, X264, X265},
+    encoder::Encoder::{Avm, SvtAv1},
     error::Xerr::{Help, Msg},
 };
 
 mod audio;
-#[cfg(all(target_feature = "avx2", not(target_feature = "avx512bw")))]
-mod avx2;
-#[cfg(target_feature = "avx512bw")]
-mod avx512;
+mod byte_range;
 mod chunk;
+mod copy;
 mod crop;
-mod decode;
-mod encode;
+#[cfg(feature = "vship")]
+mod dav1d;
+mod dec;
+mod enc;
 mod encoder;
 mod error;
 mod ffms;
 #[cfg(feature = "vship")]
 mod interp;
+mod lang;
 mod lavf;
+mod mkv;
+mod mkv_mux;
+mod mux_webm;
+mod nal_config;
+mod nal_parse;
+mod nal_scan;
+mod obu_parse;
+mod ogg;
 mod opus;
 mod pack;
 pub mod pipeline;
+mod platform;
 mod progs;
-#[cfg(not(any(target_feature = "avx2", target_feature = "avx512bw")))]
-mod scalar;
 mod scd;
 mod svt;
 mod svterr;
 #[cfg(feature = "vship")]
 mod tq;
+#[cfg(target_os = "linux")]
+mod uring;
 mod util;
 #[cfg(feature = "vship")]
 mod vship;
 mod worker;
 mod y4m;
 
-use audio::{
-    AudioSpec, AudioStream, encode_audio_streams, frame_to_sample, mux_audio, parse_audio_arg,
-};
+use audio::{AuSpec, AuStream, enc_au_streams, frame_samp, parse_au_arg};
 use chunk::{
-    Chunk, chunkify, get_resume, init_elapsed, load_scenes, merge_out, translate_scenes,
-    validate_scenes,
+    Chunk, Scene, chnkify, get_resume, init_elapsed, load_scenes, merge_out, trans_scenes,
+    val_scenes,
 };
-use crop::{CropDetectConfig, detect_crop};
-#[cfg(feature = "vship")]
-use encode::TQ_SCORES;
-use encode::encode_all;
+use crop::{CropConf, detect_crop};
+use enc::enc_all;
 use encoder::Encoder;
 use error::{IN_ALT_SCREEN, Xerr, eprint, fatal};
-use ffms::{DecodeStrat, VidInf, VideoDecoder, gcd, get_decode_strat, get_vidinf};
+use ffms::{DecStrat, VidDecoder, VidInf, get_dec_strat, get_vidinf, vid_bytes};
 use scd::fd_scenes;
-#[cfg(feature = "vship")]
-use tq::{inverse_jod, jod};
-use y4m::{PipeReader, init_pipe};
+use svterr::val;
+use y4m::{PipeReader, init_pipe, is_pipe};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -80,35 +84,32 @@ mod tests;
 
 use util::{B, C, G, N, P, R, W, Y};
 
-#[cfg(feature = "vship")]
-static TQ_RESUMED: OnceLock<bool> = OnceLock::new();
-
 #[derive(Clone)]
 pub struct Args {
     pub encoder: Encoder,
     pub worker: usize,
-    pub scene_file: PathBuf,
+    pub sc_file: PathBuf,
     pub params: String,
-    pub audio: Option<AudioSpec>,
-    pub input: PathBuf,
-    pub output: PathBuf,
-    pub decode_strat: Option<DecodeStrat>,
-    pub chunk_buffer: usize,
+    pub au: Option<AuSpec>,
+    pub inp: PathBuf,
+    pub out: PathBuf,
+    pub dec_strat: Option<DecStrat>,
+    pub chnk_buff: usize,
     pub ranges: Option<Vec<(usize, usize)>>,
     #[cfg(feature = "vship")]
     pub qp_range: Option<String>,
     #[cfg(feature = "vship")]
     pub metric_worker: usize,
     #[cfg(feature = "vship")]
-    pub target_quality: Option<String>,
+    pub tq: Option<String>,
     #[cfg(feature = "vship")]
     pub metric_mode: String,
     #[cfg(feature = "vship")]
-    pub cvvdp_config: Option<String>,
+    pub cvvdp_conf: Option<String>,
     #[cfg(feature = "vship")]
-    pub probe_params: Option<String>,
+    pub alt_param: Option<String>,
     pub sc_only: bool,
-    pub hwaccel: bool,
+    pub hwdec: bool,
 }
 
 extern "C" fn restore() {
@@ -127,49 +128,24 @@ fn print_help() {
     println!("{P}Format: {Y}xav {C}[options] {G}<INPUT> {B}[<OUTPUT>]{W}");
     println!();
     println!("{C}-e {P}┃ {C}--encoder    {W}Encoder used: {R}<{G}svt-av1{P}┃{G}avm{P}┃{G}vvenc{P}┃{G}x265{P}┃{G}x264{R}>");
-    println!("{C}-p {P}┃ {C}--param      {W}Encoder params");
     println!("{C}-w {P}┃ {C}--worker     {W}Encoder count");
-    println!("{C}-b {P}┃ {C}--buffer     {W}Extra chunks to hold in front buffer");
-    println!("{C}-s {P}┃ {C}--sc         {W}Specify SCD file. Auto gen if not specified");
-    println!("{C}-r {P}┃ {C}--range      {W}Trim and splice frame ranges: {G}\"10-20,90-100\"");
-    println!("{C}-a {P}┃ {C}--audio      {W}Encode to Opus: {Y}-a {G}\"{R}<{G}auto{P}┃{G}norm{P}┃{G}bitrate{R}> {R}<{G}all{P}┃{G}stream_ids{R}>{G}\"");
-    println!("                  {B}Examples: {Y}-a {G}\"auto all\"{W}, {Y}-a {G}\"norm 1\"{W}, {Y}-a {G}\"128 1,2\"");
-    #[cfg(feature = "vship")]
-    {
-        println!("{C}-t {P}┃ {C}--tq         {W}TQ Range: {R}<8{B}={W}Butter5pn, {R}8-10{B}={W}CVVDP, {R}>10{B}={W}SSIMU2: {Y}-t {G}9.00-9.01");
-        println!("{C}-m {P}┃ {C}--mode       {W}TQ Metric aggregation: {G}mean {W}or mean of worst N%: {G}p0.1");
-        println!("{C}-f {P}┃ {C}--qp         {W}CRF range for TQ: {Y}-f {G}0.25-69.75{W}");
-        println!("{C}-v {P}┃ {C}--vship      {W}Metric worker count");
-        println!("{C}-d {P}┃ {C}--display    {W}Display JSON file for CVVDP. Screen name must be {R}xav{W}");
-        println!("{C}-P {P}┃ {C}--alt-param  {W}Alt params for TQ probing ({R}NOT RECOMMENDED{W}; expert-only)");
-    }
-    println!("   {P}┃ {C}--hwaccel    {W}Use Vulkan hw decoding (perf depends on the input video and hardware)");
+    println!("{C}-b {P}┃ {C}--buff       {W}Extra chunks to pre-decode");
+    println!("{C}-p {P}┃ {C}--param      {W}Encoder params");
+    println!("{C}-s {P}┃ {C}--sc         {W}Specify SCD file");
     println!("   {P}┃ {C}--sc-only    {W}Exit after SCD");
-
-    println!();
-    println!("{P}Example:{W}");
-    println!("{Y}xav {P}\\{W}");
-    println!("  {C}-e {G}svt-av1          {P}\\  {B}# {W}Use svt-av1 as the encoder");
-    println!("  {C}-p {G}\"--scm 0 --lp 5\" {P}\\  {B}# {W}Params (after defaults) used by the encoder");
-    println!("  {C}-w {R}5                {P}\\  {B}# {W}Spawn {R}5 {W}encoder instances simultaneously");
-    println!("  {C}-b {R}1                {P}\\  {B}# {W}Decode {R}1 {W}extra chunk in memory for less waiting");
-    println!("  {C}-s {G}scd.txt          {P}\\  {B}# {W}Optionally use a scene file from external SCD tools");
-    println!("  {C}-r {G}\"0-120,240-480\"  {P}\\  {B}# {W}Only encode given frame ranges and combine");
-    println!("  {C}-a {G}\"norm 1,2\"       {P}\\  {B}# {W}Encode {R}2 {W}streams using Opus with stereo downmixing");
+    println!("   {P}┃ {C}--hwdec      {W}Use GPU decode");
+    println!("{C}-r {P}┃ {C}--range      {W}Trim and splice: {G}\"10-20,90-100\"");
+    println!("{C}-a {P}┃ {C}--audio      {W}Opus Enc: {Y}-a {G}\"{R}<{G}auto{P}┃{G}norm{P}┃{G}bitrate{R}> {R}<{G}all{P}┃{G}stream_ids{R}>{G}\"");
+    println!("   {P}┃ {C}--guide      {W}Very detailed user guide");
     #[cfg(feature = "vship")]
     {
-        println!("  {C}-t {G}9.444-9.555      {P}\\  {B}# {W}Enable TQ mode with CVVDP using this allowed range");
-        println!("  {C}-m {G}p1.25            {P}\\  {B}# {W}Use the mean of worst {R}1.25% {W}of frames for TQ scoring");
-        println!("  {C}-f {G}4.25-63.75       {P}\\  {B}# {W}Allowed CRF range for target quality mode");
-        println!("  {C}-v {R}3                {P}\\  {B}# {W}Spawn {R}3 {W}vship/metric workers");
-        println!("  {C}-d {G}display.json     {P}\\  {B}# {W}Uses {G}display.json {W}for CVVDP screen specification");
+        println!("{C}-t {P}┃ {C}--tq         {W}TQ Range: {R}<8{B}={W}Butter, {R}8-10{B}={W}CVVDP, {R}>10{B}={W}SSIMU2");
+        println!("{C}-m {P}┃ {C}--mode       {W}TQ Metric stat: {G}mean {W}or pN%");
+        println!("{C}-f {P}┃ {C}--qp         {W}CRF range for TQ: {G}crf-crf{W}");
+        println!("{C}-v {P}┃ {C}--vship      {W}Metric worker count");
+        println!("{C}-d {P}┃ {C}--display    {W}CVVDP display file. Set screen name as {R}xav{W}");
+        println!("{C}-P {P}┃ {C}--alt-param  {W}Alt params for TQ probes ({R}NOT RECOMMENDED{W}; expert-only)");
     }
-    println!("  {G}input.mkv           {P}\\  {B}# {W}Name or path of the input file");
-    println!("  {G}output.mkv             {B}# {W}Optional output name");
-    println!();
-    println!("{Y}Worker {P}┃ {Y}Buffer {P}┃ {Y}Metric worker count {W}depend on the OS");
-    println!("hardware, content, parameters and other variables");
-    println!("Experiment and use the sweet spot values for your case");
 }
 
 fn parse_args() -> Result<Args, Xerr> {
@@ -194,24 +170,20 @@ fn parse_ranges(s: &str) -> Result<Vec<(usize, usize)>, Xerr> {
 }
 
 fn apply_defaults(args: &mut Args) {
-    if args.output == PathBuf::new() {
-        let stem = unsafe { args.input.file_stem().unwrap_unchecked() }.to_string_lossy();
-        let ext = match args.encoder {
-            SvtAv1 | X265 | X264 => "mkv",
-            Avm => "ivf",
-            Vvenc => "mp4",
-        };
-        args.output = args.input.with_file_name(format!("{stem}_xav.{ext}"));
+    if args.out == PathBuf::new() {
+        let stem = unsafe { args.inp.file_stem().unwrap_unchecked() }.to_string_lossy();
+        let ext = if args.encoder == Avm { "ivf" } else { "mkv" };
+        args.out = args.inp.with_file_name(format!("{stem}_xav.{ext}"));
     }
 
-    if args.scene_file == PathBuf::new() {
-        let stem = unsafe { args.input.file_stem().unwrap_unchecked() }.to_string_lossy();
-        args.scene_file = args.input.with_file_name(format!("{stem}_scd.txt"));
+    if args.sc_file == PathBuf::new() {
+        let stem = unsafe { args.inp.file_stem().unwrap_unchecked() }.to_string_lossy();
+        args.sc_file = args.inp.with_file_name(format!("{stem}_scd.txt"));
     }
 
     #[cfg(feature = "vship")]
     {
-        if args.target_quality.is_some() && args.qp_range.is_none() {
+        if args.tq.is_some() && args.qp_range.is_none() {
             args.qp_range = Some("8.0-48.0".to_owned());
         }
     }
@@ -222,23 +194,20 @@ fn next_arg<'a>(args: &'a [String], i: &mut usize) -> Option<&'a str> {
     args.get(*i).map(String::as_str)
 }
 
-fn validate_output(output: &Path, encoder: Encoder) -> Result<(), Xerr> {
-    let ext = output.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let containers = match encoder {
-        SvtAv1 => "mkv, mp4, webm",
-        Avm => "ivf",
-        Vvenc => "mp4",
-        X265 | X264 => "mkv, mp4",
-    };
-    if !containers.split(", ").any(|c| c == ext) {
-        return Err(format!("Invalid extension .{ext} for {encoder:?}. Use: {containers}").into());
+fn val_out(out: &Path, encoder: Encoder) -> Result<(), Xerr> {
+    let ext = out.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match (encoder, ext) {
+        (Avm, "ivf") | (SvtAv1, "webm") => Ok(()),
+        (Avm, _) => Err(format!("Invalid extension .{ext} for {encoder:?}. Use: ivf").into()),
+        (_, "mkv") => Ok(()),
+        (_, "webm") => Err(format!("webm output requires svt-av1, not {encoder:?}").into()),
+        _ => Err(format!("Invalid extension .{ext} for {encoder:?}. Use: mkv, webm").into()),
     }
-    Ok(())
 }
 
 #[cfg(feature = "vship")]
-fn validate_range(s: &str, name: &str) -> Result<(), Xerr> {
-    let parts: Vec<f64> = s.split('-').filter_map(|v| v.parse().ok()).collect();
+fn val_range(s: &str, name: &str) -> Result<(), Xerr> {
+    let parts: Vec<f32> = s.split('-').filter_map(|v| v.parse().ok()).collect();
     if parts.len() != 2 {
         return Err(format!("{name} requires a range: <min>-<max>").into());
     }
@@ -277,12 +246,12 @@ macro_rules! arg {
 }
 
 fn parse_args_loop(args: &[String]) -> Result<Args, Xerr> {
-    let (mut worker, mut chunk_buffer, mut sc_only, mut hwaccel) = (1usize, None, false, false);
-    let (mut scene_file, mut input, mut output) = (PathBuf::new(), PathBuf::new(), PathBuf::new());
+    let (mut worker, mut chnk_buff, mut sc_only, mut hwdec) = (1usize, None, false, false);
+    let (mut sc_file, mut inp, mut out) = (PathBuf::new(), PathBuf::new(), PathBuf::new());
     let (mut encoder, mut params) = (Encoder::default(), String::new());
-    let (mut audio, mut ranges) = (None, None);
+    let (mut au, mut ranges) = (None, None);
     #[cfg(feature = "vship")]
-    let (mut target_quality, mut qp_range, mut cvvdp_config, mut probe_params) = (
+    let (mut tq, mut qp_range, mut cvvdp_conf, mut alt_param) = (
         None::<String>,
         None::<String>,
         None::<String>,
@@ -301,9 +270,9 @@ fn parse_args_loop(args: &[String]) -> Result<Args, Xerr> {
                 }
             }
             "-w" | "--worker" => arg!(parse args, i, worker),
-            "-s" | "--sc" => arg!(path args, i, scene_file),
+            "-s" | "--sc" => arg!(path args, i, sc_file),
             "-p" | "--param" => arg!(str args, i, params),
-            "-b" | "--buffer" => arg!(opt_parse args, i, chunk_buffer),
+            "-b" | "--buff" => arg!(opt_parse args, i, chnk_buff),
             "-r" | "--range" => {
                 if let Some(v) = next_arg(args, &mut i) {
                     ranges = Some(parse_ranges(v)?);
@@ -311,11 +280,11 @@ fn parse_args_loop(args: &[String]) -> Result<Args, Xerr> {
             }
             "-a" | "--audio" => {
                 if let Some(v) = next_arg(args, &mut i) {
-                    audio = Some(parse_audio_arg(v)?);
+                    au = Some(parse_au_arg(v)?);
                 }
             }
             #[cfg(feature = "vship")]
-            "-t" | "--tq" => arg!(opt args, i, target_quality),
+            "-t" | "--tq" => arg!(opt args, i, tq),
             #[cfg(feature = "vship")]
             "-m" | "--mode" => arg!(str args, i, metric_mode),
             #[cfg(feature = "vship")]
@@ -323,20 +292,20 @@ fn parse_args_loop(args: &[String]) -> Result<Args, Xerr> {
             #[cfg(feature = "vship")]
             "-v" | "--vship" => arg!(parse args, i, metric_worker),
             #[cfg(feature = "vship")]
-            "-d" | "--display" => arg!(opt args, i, cvvdp_config),
+            "-d" | "--display" => arg!(opt args, i, cvvdp_conf),
             #[cfg(feature = "vship")]
-            "-P" | "--probe-param" => arg!(opt args, i, probe_params),
-            "--hwaccel" => hwaccel = true,
+            "-P" | "--probe-param" => arg!(opt args, i, alt_param),
+            "--hwdec" => hwdec = true,
             "--sc-only" => sc_only = true,
             "-h" | "--help" => {
                 print_help();
                 return Err(Help);
             }
             arg if !arg.starts_with('-') => {
-                if input == PathBuf::new() {
-                    input = PathBuf::from(arg);
-                } else if output == PathBuf::new() {
-                    output = PathBuf::from(arg);
+                if inp == PathBuf::new() {
+                    inp = PathBuf::from(arg);
+                } else if out == PathBuf::new() {
+                    out = PathBuf::from(arg);
                 }
             }
             _ => return Err(format!("Unknown arg: {}", args[i]).into()),
@@ -347,18 +316,18 @@ fn parse_args_loop(args: &[String]) -> Result<Args, Xerr> {
     Ok(Args {
         encoder,
         worker,
-        scene_file,
+        sc_file,
         params,
-        audio,
-        input,
-        output,
-        decode_strat: None,
-        chunk_buffer: worker + chunk_buffer.unwrap_or(0),
+        au,
+        inp,
+        out,
+        dec_strat: None,
+        chnk_buff: worker + chnk_buff.unwrap_or(0),
         ranges,
         sc_only,
-        hwaccel,
+        hwdec,
         #[cfg(feature = "vship")]
-        target_quality,
+        tq,
         #[cfg(feature = "vship")]
         metric_mode,
         #[cfg(feature = "vship")]
@@ -366,9 +335,9 @@ fn parse_args_loop(args: &[String]) -> Result<Args, Xerr> {
         #[cfg(feature = "vship")]
         metric_worker,
         #[cfg(feature = "vship")]
-        cvvdp_config,
+        cvvdp_conf,
         #[cfg(feature = "vship")]
-        probe_params,
+        alt_param,
     })
 }
 
@@ -379,46 +348,47 @@ fn get_args(args: &[String], allow_resume: bool) -> Result<Args, Xerr> {
 
     let mut result = parse_args_loop(args)?;
 
-    if allow_resume && let Ok(saved_args) = get_saved_args(&result.input) {
+    if result.inp == PathBuf::new() {
+        return Err("Missing input".into());
+    }
+
+    if allow_resume && let Ok(saved_args) = get_saved_args(&result.inp) {
         return Ok(saved_args);
     }
-    if result.output != PathBuf::new() {
-        validate_output(&result.output, result.encoder)?;
+    if result.out != PathBuf::new() {
+        val_out(&result.out, result.encoder)?;
     }
 
     apply_defaults(&mut result);
 
-    if result.scene_file == PathBuf::new()
-        || result.input == PathBuf::new()
-        || result.output == PathBuf::new()
-    {
-        return Err("Missing args".into());
-    }
-
     #[cfg(feature = "vship")]
-    if let Some(ref tq) = result.target_quality {
-        validate_range(tq, "-t/--tq")?;
-        validate_range(
+    if let Some(ref tq) = result.tq {
+        val_range(tq, "-t/--tq")?;
+        val_range(
             unsafe { result.qp_range.as_ref().unwrap_unchecked() },
             "-f/--qp",
         )?;
     }
 
     if result.encoder == SvtAv1 {
-        svterr::validate(&result.params)?;
+        val(&result.params)?;
         #[cfg(feature = "vship")]
-        if let Some(ref pp) = result.probe_params {
-            svterr::validate(pp)?;
+        if let Some(ref pp) = result.alt_param {
+            val(pp)?;
         }
+    }
+
+    if result.hwdec && is_pipe() {
+        return Err("Hardware accelerated decoding can not be used with a pipe".into());
     }
 
     Ok(result)
 }
 
-fn hash_input(path: &Path) -> String {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+fn hash_inp(path: &Path) -> String {
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let mut hasher = DefaultHasher::new();
-    canonical.hash(&mut hasher);
+    canon.hash(&mut hasher);
     format!("{:x}", hasher.finish())
 }
 
@@ -438,14 +408,14 @@ fn save_args(work_dir: &Path) -> Result<(), Xerr> {
     Ok(())
 }
 
-fn get_saved_args(input: &Path) -> Result<Args, Xerr> {
-    let canonical = input.canonicalize()?;
-    let hash = hash_input(&canonical);
-    let work_dir = canonical.with_file_name(format!(".{}", &hash[..7]));
+fn get_saved_args(inp: &Path) -> Result<Args, Xerr> {
+    let canon = inp.canonicalize()?;
+    let hash = hash_inp(&canon);
+    let work_dir = canon.with_file_name(format!(".{}", &hash[..7]));
     let cmd_path = work_dir.join("cmd.txt");
 
     if cmd_path.exists() && get_resume(&work_dir).is_some_and(|r| !r.chnks_done.is_empty()) {
-        let cmd_line = read_to_string(cmd_path)?;
+        let cmd_line = read_to_str(cmd_path)?;
         let saved_args = parse_quoted_args(&cmd_line);
         get_args(&saved_args, false)
     } else {
@@ -478,9 +448,9 @@ fn parse_quoted_args(cmd_line: &str) -> Vec<String> {
     args
 }
 
-fn ensure_scene_file(args: &Args, inf: &VidInf, crop: (u32, u32), line: usize) -> Result<(), Xerr> {
-    if !args.scene_file.exists() {
-        fd_scenes(&args.input, &args.scene_file, inf, crop, line, args.hwaccel)?;
+fn ensure_sc_file(args: &Args, inf: &VidInf, crop: (u32, u32), line: usize) -> Result<(), Xerr> {
+    if !args.sc_file.exists() {
+        fd_scenes(&args.inp, &args.sc_file, inf, crop, line, args.hwdec)?;
     }
     Ok(())
 }
@@ -505,11 +475,11 @@ fn init_pipe_crop(inf: VidInf, crop: (u32, u32)) -> (VidInf, (u32, u32), Option<
         let (cv, ch) = crop;
         let target_w = inf.width - ch * 2;
         let target_h = inf.height - cv * 2;
-        let matches_original_ar = y.width * inf.height == y.height * inf.width;
-        let matches_cropped_ar = y.width * target_h == y.height * target_w;
-        let new_crop = if matches_cropped_ar {
+        let match_orig_ar = y.width * inf.height == y.height * inf.width;
+        let match_crop_ar = y.width * target_h == y.height * target_w;
+        let new_crop = if match_crop_ar {
             (0, 0)
-        } else if matches_original_ar {
+        } else if match_orig_ar {
             scale_crop(crop, inf.width, inf.height, y.width, y.height)
         } else {
             (0, 0)
@@ -525,106 +495,83 @@ fn init_pipe_crop(inf: VidInf, crop: (u32, u32)) -> (VidInf, (u32, u32), Option<
     }
 }
 
-fn adjust_dar(inf: &mut VidInf, crop: (u32, u32)) {
-    if let Some((dw, dh)) = inf.dar {
-        let fw = u64::from(inf.width - crop.1 * 2);
-        let fh = u64::from(inf.height - crop.0 * 2);
-        let n = u64::from(dw) * u64::from(inf.height) * fw;
-        let d = u64::from(dh) * u64::from(inf.width) * fh;
-        let g = gcd(n, d);
-        inf.dar = Some(((n / g) as u32, (d / g) as u32));
-    }
-}
-
-fn finalize_audio(
-    spec: &AudioSpec,
-    cached: Option<Vec<(AudioStream, PathBuf)>>,
+fn acq_au(
+    spec: &AuSpec,
+    cached: Option<Vec<(AuStream, PathBuf)>>,
     args: &Args,
     inf: &VidInf,
-    video_mkv: &Path,
     work_dir: &Path,
-) -> Result<(), Xerr> {
-    let files = if let Some(f) = cached {
-        f
-    } else {
-        print!("\x1b[H\x1b[2J");
-        _ = stdout().flush();
-        let sample_ranges = args.ranges.as_ref().map(|r| {
-            r.iter()
-                .map(|&(s, e)| {
-                    (
-                        frame_to_sample(s, inf.fps_num, inf.fps_den, 48000),
-                        frame_to_sample(e, inf.fps_num, inf.fps_den, 48000),
-                    )
-                })
-                .collect::<Vec<_>>()
-        });
-        encode_audio_streams(spec, &args.input, work_dir, sample_ranges.as_deref(), 1)?
-    };
-    mux_audio(
-        &files,
-        video_mkv,
-        &args.input,
-        &args.output,
-        args.ranges.is_some(),
-        inf.dar,
-    )?;
-    remove_file(video_mkv)?;
-    Ok(())
+) -> Result<Vec<(AuStream, PathBuf)>, Xerr> {
+    if let Some(f) = cached {
+        return Ok(f);
+    }
+    print!("\x1b[H\x1b[2J");
+    _ = stdout().flush();
+    let samp_ranges = args.ranges.as_ref().map(|r| {
+        r.iter()
+            .map(|&(s, e)| {
+                (
+                    frame_samp(s, inf.fps_num, inf.fps_den, 48000),
+                    frame_samp(e, inf.fps_num, inf.fps_den, 48000),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    enc_au_streams(spec, &args.inp, work_dir, samp_ranges.as_deref(), 1)
 }
 
-type AudioResult = Vec<(AudioStream, PathBuf)>;
-type AudioHandle = JoinHandle<Result<AudioResult, Xerr>>;
+type AuResult = Vec<(AuStream, PathBuf)>;
+type AuHandle = JoinHandle<Result<AuResult, Xerr>>;
 
-fn spawn_audio(args: &Args, work_dir: &Path, inf: &VidInf) -> Option<AudioHandle> {
-    (!args.scene_file.exists() && args.audio.is_some() && args.encoder != Avm).then(|| {
-        let spec = unsafe { args.audio.as_ref().unwrap_unchecked() }.clone();
-        let input = args.input.clone();
+fn spawn_au(args: &Args, work_dir: &Path, inf: &VidInf) -> Option<AuHandle> {
+    (!args.sc_file.exists() && args.au.is_some() && args.encoder != Avm).then(|| {
+        let spec = unsafe { args.au.as_ref().unwrap_unchecked() }.clone();
+        let inp = args.inp.clone();
         let wd = work_dir.to_path_buf();
         let ranges = args.ranges.clone();
         let fps_num = inf.fps_num;
         let fps_den = inf.fps_den;
 
         spawn(move || {
-            let sample_ranges = ranges.as_ref().map(|r| {
+            let samp_ranges = ranges.as_ref().map(|r| {
                 r.iter()
                     .map(|&(s, e)| {
                         (
-                            frame_to_sample(s, fps_num, fps_den, 48000),
-                            frame_to_sample(e, fps_num, fps_den, 48000),
+                            frame_samp(s, fps_num, fps_den, 48000),
+                            frame_samp(e, fps_num, fps_den, 48000),
                         )
                     })
                     .collect::<Vec<_>>()
             });
-            encode_audio_streams(&spec, &input, &wd, sample_ranges.as_deref(), 3)
+            enc_au_streams(&spec, &inp, &wd, samp_ranges.as_deref(), 5)
         })
     })
 }
 
-fn scd_and_audio(
+fn scd_and_au(
     args: &Args,
     inf: &VidInf,
     crop: (u32, u32),
-    audio_handle: Option<AudioHandle>,
-) -> Result<Option<AudioResult>, Xerr> {
-    if let Some(handle) = audio_handle {
-        fd_scenes(&args.input, &args.scene_file, inf, crop, 1, args.hwaccel)?;
+    au_handle: Option<AuHandle>,
+) -> Result<Option<AuResult>, Xerr> {
+    if let Some(handle) = au_handle {
+        fd_scenes(&args.inp, &args.sc_file, inf, crop, 3, args.hwdec)?;
         let result = handle
             .join()
             .map_err(|_e| Msg("Audio encoding thread panicked".into()))?;
         Ok(Some(result?))
     } else {
-        ensure_scene_file(args, inf, crop, 0)?;
+        ensure_sc_file(args, inf, crop, 3)?;
         Ok(None)
     }
 }
 
-fn validate_all_scenes(scenes: &[chunk::Scene], enc: Encoder) -> Result<(), Xerr> {
-    validate_scenes(scenes)?;
+fn val_all_scenes(scenes: &[Scene], enc: Encoder) -> Result<(), Xerr> {
+    val_scenes(scenes)?;
     if enc == SvtAv1 {
         for s in scenes {
             if let Some(ref p) = s.params {
-                svterr::validate(p)?;
+                val(p)?;
             }
         }
     }
@@ -636,55 +583,50 @@ fn main_with_args(args: &Args) -> Result<(), Xerr> {
     _ = stdout().flush();
     IN_ALT_SCREEN.store(true, Relaxed);
 
-    let canonical_input = args.input.canonicalize()?;
-    let hash = hash_input(&canonical_input);
-    let work_dir = canonical_input.with_file_name(format!(".{}", &hash[..7]));
+    let canon_inp = args.inp.canonicalize()?;
+    let hash = hash_inp(&canon_inp);
+    let work_dir = canon_inp.with_file_name(format!(".{}", &hash[..7]));
 
-    #[cfg(feature = "vship")]
-    let is_new_encode = !work_dir.exists();
     create_dir_all(&work_dir)?;
-
-    #[cfg(feature = "vship")]
-    TQ_RESUMED.get_or_init(|| !is_new_encode);
 
     if get_resume(&work_dir).is_none_or(|r| r.chnks_done.is_empty()) {
         save_args(&work_dir)?;
     }
 
-    if args.sc_only && args.scene_file.exists() {
-        return Err(format!("Scene file already exists: {}", args.scene_file.display()).into());
+    if args.sc_only && args.sc_file.exists() {
+        return Err(format!("Scene file already exists: {}", args.sc_file.display()).into());
     }
 
-    let inf = get_vidinf(&args.input)?;
+    let inf = get_vidinf(&args.inp)?;
 
-    let audio_handle = spawn_audio(args, &work_dir, &inf);
+    let au_handle = spawn_au(args, &work_dir, &inf);
 
     let thr = unsafe { available_parallelism().unwrap_unchecked().get() as i32 };
-    let config = CropDetectConfig {
-        sample_count: 13,
-        min_black_pixels: 2,
+    let conf = CropConf {
+        sample_cnt: 13,
+        min_black_pix: 2,
     };
-    let crop = match detect_crop(&args.input, &inf, &config, thr) {
+    let crop = match detect_crop(&args.inp, &inf, &conf, thr, 1) {
         Ok(detected) if detected.has_crop() => detected.to_tuple(),
         _ => (0, 0),
     };
 
-    let audio_files = scd_and_audio(args, &inf, crop, audio_handle)?;
+    let au_files = scd_and_au(args, &inf, crop, au_handle)?;
 
     print!("\x1b[H\x1b[2J");
     _ = stdout().flush();
 
     let mut args = args.clone();
 
-    let scenes = load_scenes(&args.scene_file, inf.frames)?;
+    let scenes = load_scenes(&args.sc_file, inf.frames)?;
 
     let scenes = if let Some(ref r) = args.ranges {
-        translate_scenes(&scenes, r)
+        trans_scenes(&scenes, r)
     } else {
         scenes
     };
 
-    validate_all_scenes(&scenes, args.encoder)?;
+    val_all_scenes(&scenes, args.encoder)?;
     if args.sc_only {
         return Ok(());
     }
@@ -694,79 +636,62 @@ fn main_with_args(args: &Args) -> Result<(), Xerr> {
 
     let (mut inf, crop, pipe_reader) = init_pipe_crop(inf, crop);
 
-    adjust_dar(&mut inf, crop);
-
     #[cfg(feature = "vship")]
-    let tq = args.target_quality.is_some();
+    let tq = args.tq.is_some();
     #[cfg(not(feature = "vship"))]
     let tq = false;
-    if args.hwaccel {
-        let mut dec = VideoDecoder::new_hw(&args.input, 1)?;
-        inf.y_linesize = unsafe { (*dec.decode_next()).linesize[0] as usize };
+    if args.hwdec {
+        let mut dec = VidDecoder::new_hw(&args.inp, 1)?;
+        inf.y_linesz = unsafe { (*dec.dec_next()).linesize[0] as usize };
     }
-    args.decode_strat = Some(get_decode_strat(&inf, crop, args.hwaccel, tq));
+    args.dec_strat = Some(get_dec_strat(&inf, crop, args.hwdec, tq));
 
-    let chunks = chunkify(&scenes);
+    let chnks = chnkify(&scenes);
 
     let prior_secs = get_resume(&work_dir).map_or(0, |r| r.prior_secs);
     init_elapsed(prior_secs);
     let enc_start = Instant::now();
-    encode_all(&chunks, &inf, &args, &args.input, &work_dir, pipe_reader);
-    let enc_time = enc_start.elapsed() + Duration::from_secs(prior_secs);
+    enc_all(&chnks, &inf, &args, &args.inp, &work_dir, pipe_reader);
+    let enc_time = enc_start.elapsed() + Durat::from_secs(prior_secs);
 
-    let video_mkv = work_dir.join("encode").join("video.mkv");
-
-    merge_out(
-        &work_dir.join("encode"),
-        if args.audio.is_some() && args.encoder != Avm {
-            &video_mkv
-        } else {
-            &args.output
-        },
-        &inf,
-        if args.audio.is_some() || args.encoder == Avm {
-            None
-        } else {
-            Some(&args.input)
-        },
-        args.encoder,
-        args.ranges.as_deref(),
-    )?;
-
-    if let Some(ref audio_spec) = args.audio
+    let au_tracks = if let Some(ref au_spec) = args.au
         && args.encoder != Avm
     {
-        finalize_audio(audio_spec, audio_files, &args, &inf, &video_mkv, &work_dir)?;
+        acq_au(au_spec, au_files, &args, &inf, &work_dir)?
+    } else {
+        Vec::new()
+    };
+
+    merge_out(&args, &work_dir.join("encode"), &inf, &au_tracks, crop)?;
+
+    for t in &au_tracks {
+        _ = rm_file(&t.1);
     }
 
-    print_summary(&args, &inf, &chunks, crop, enc_time);
-    remove_dir_all(&work_dir)?;
+    print_sum(&args, &inf, &chnks, crop, enc_time);
+    rm_dir_all(&work_dir)?;
     Ok(())
 }
 
-fn print_summary(
-    args: &Args,
-    inf: &VidInf,
-    chunks: &[Chunk],
-    crop: (u32, u32),
-    enc_time: Duration,
-) {
+fn print_sum(args: &Args, inf: &VidInf, chnks: &[Chunk], crop: (u32, u32), enc_time: Durat) {
+    let tot_frames: usize = chnks.iter().map(|c| c.end - c.start).sum();
+    let inp_sz = vid_bytes(&args.inp, args.ranges.as_deref(), tot_frames);
+    let out_sz = vid_bytes(&args.out, None, tot_frames);
+
     print!("\x1b[?25h\x1b[?1049l");
     _ = stdout().flush();
+    let durat = tot_frames as f32 * inf.fps_den as f32 / inf.fps_num as f32;
+    let inp_br = inp_sz as f32 * 8.0 / durat / 1000.0;
+    let out_br = out_sz as f32 * 8.0 / durat / 1000.0;
+    let change = ((out_sz as f32 / inp_sz as f32) - 1.0) * 100.0;
 
-    let input_size = metadata(&args.input).map_or(0, |m| m.len());
-    let output_size = metadata(&args.output).map_or(0, |m| m.len());
-    let total_frames: usize = chunks.iter().map(|c| c.end - c.start).sum();
-    let duration = total_frames as f64 * f64::from(inf.fps_den) / f64::from(inf.fps_num);
-    let input_br = (input_size as f64 * 8.0) / duration / 1000.0;
-    let output_br = (output_size as f64 * 8.0) / duration / 1000.0;
-    let change = ((output_size as f64 / input_size as f64) - 1.0) * 100.0;
-
-    let fmt_size = |b: u64| {
-        if b > 1_000_000_000 {
-            format!("{:.2} GB", b as f64 / 1_000_000_000.0)
+    let fmt_sz = |b: u64| {
+        if b >= 1_000_000_000 {
+            format!("{:.2} GB", b as f32 / 1_000_000_000.0)
+        } else if b >= 1_000_000 {
+            format!("{:.2} MB", b as f32 / 1_000_000.0)
         } else {
-            format!("{:.2} MB", b as f64 / 1_000_000.0)
+            format!("{} KB", b / 1_000)
         }
     };
 
@@ -776,11 +701,11 @@ fn print_summary(
         "\u{f06c3}"
     };
     let change_color = if change < 0.0 { G } else { R };
-    let fps_rate = f64::from(inf.fps_num) / f64::from(inf.fps_den);
-    let enc_speed = total_frames as f64 / enc_time.as_secs_f64();
+    let fps_rate = inf.fps_num as f32 / inf.fps_den as f32;
+    let enc_spd = tot_frames as f32 / enc_time.as_secs_f32();
     let enc_secs = enc_time.as_secs();
     let (eh, em, es) = (enc_secs / 3600, (enc_secs % 3600) / 60, enc_secs % 60);
-    let dur_secs = duration as u64;
+    let dur_secs = durat as u64;
     let (dh, dm, ds) = (dur_secs / 3600, (dur_secs % 3600) / 60, dur_secs % 60);
     let (final_width, final_height) = (inf.width - crop.1 * 2, inf.height - crop.0 * 2);
 
@@ -790,16 +715,16 @@ fn print_summary(
 {P}┣━━━━━━━━━━━╋━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n\
 {P}┃ {Y}Size      {P}┃ {R}{:<98} {P}┃\n\
 {P}┣━━━━━━━━━━━╋━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n\
-{P}┃ {Y}Video     {P}┃ {W}{:<4}x{:<4} {P}┃ {B}{:.3} fps {P}┃ {W}{:02}{C}:{W}{:02}{C}:{W}{:02}{:<30} {P}┃\n\
+{P}┃ {Y}Video     {P}┃ {W}{:>4}x{:<4} {P}┃ {B}{:.3} fps {P}┃ {W}{:02}{C}:{W}{:02}{C}:{W}{:02}{:<30} {P}┃\n\
 {P}┣━━━━━━━━━━━╋━━━━━━━━━━━┻━━━━━━━━━━━━┻━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n\
 {P}┃ {Y}Time      {P}┃ {W}{:02}{C}:{W}{:02}{C}:{W}{:02} {B}@ {:>6.2} fps{:<42} {P}┃\n\
 {P}┗━━━━━━━━━━━┻━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{N}",
-    unsafe { args.input.file_name().unwrap_unchecked() }.to_string_lossy(),
-    unsafe { args.output.file_name().unwrap_unchecked() }.to_string_lossy(),
+    unsafe { args.inp.file_name().unwrap_unchecked() }.to_string_lossy(),
+    unsafe { args.out.file_name().unwrap_unchecked() }.to_string_lossy(),
     format!("{} {C}({:.0} kb/s) {G}󰛂 {G}{} {C}({:.0} kb/s) {}{} {:.2}%",
-        fmt_size(input_size), input_br, fmt_size(output_size), output_br, change_color, arrow, change.abs()),
+        fmt_sz(inp_sz), inp_br, fmt_sz(out_sz), out_br, change_color, arrow, change.abs()),
     final_width, final_height, fps_rate, dh, dm, ds, "",
-    eh, em, es, enc_speed, ""
+    eh, em, es, enc_spd, ""
 );
 }
 
@@ -809,13 +734,13 @@ fn main() -> Result<(), Xerr> {
         Err(Help) => return Ok(()),
         Err(e) => return Err(e),
     };
-    let output = args.output.clone();
+    let out = args.out.clone();
 
     set_hook(Box::new(move |panic_info| {
         print!("\x1b[?25h\x1b[?1049l");
         _ = stdout().flush();
         eprint(format_args!("{panic_info}"));
-        eprint(format_args!("{}, FAIL", output.display()));
+        eprint(format_args!("{}, FAIL", out.display()));
     }));
 
     unsafe {
@@ -829,60 +754,7 @@ fn main() -> Result<(), Xerr> {
     if let Err(e) = main_with_args(&args) {
         print!("\x1b[?1049l");
         _ = stdout().flush();
-        fatal(format_args!("{e}\n{}, FAIL", args.output.display()));
-    }
-
-    #[cfg(feature = "vship")]
-    if args.target_quality.is_some()
-        && let Some(v) = TQ_SCORES.get()
-    {
-        let mut s = unsafe { v.lock().unwrap_unchecked() }.clone();
-
-        let tq_parts: Vec<f64> = unsafe { args.target_quality.as_ref().unwrap_unchecked() }
-            .split('-')
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        let tq_target = f64::midpoint(tq_parts[0], tq_parts[1]);
-        let is_butteraugli = tq_target < 8.0;
-        let cvvdp_per_frame =
-            tq_target > 8.0 && tq_target <= 10.0 && args.metric_mode.starts_with('p');
-
-        if is_butteraugli {
-            s.sort_unstable_by(|a, b| b.total_cmp(a));
-        } else {
-            s.sort_unstable_by(f64::total_cmp);
-        }
-
-        let jod_mean = |scores: &[f64]| -> f64 {
-            let q = scores.iter().map(|&x| inverse_jod(x)).sum::<f64>() / scores.len() as f64;
-            jod(q)
-        };
-
-        let m = if cvvdp_per_frame {
-            jod_mean(&s)
-        } else {
-            s.iter().sum::<f64>() / s.len() as f64
-        };
-
-        if TQ_RESUMED.get().copied().unwrap_or(false) {
-            println!("\nBelow stats are only for the last run when resume used\n");
-            println!("{Y}Mean: {W}{m:.4}");
-        } else {
-            println!("\n{Y}Mean: {W}{m:.4}");
-        }
-        for p in [25.0, 10.0, 5.0, 1.0, 0.1] {
-            let i = ((s.len() as f64 * p / 100.0).ceil() as usize).min(s.len());
-            let pct_mean = if cvvdp_per_frame {
-                jod_mean(&s[..i])
-            } else {
-                s[..i].iter().sum::<f64>() / i as f64
-            };
-            println!("{Y}Mean of worst {p}%: {W}{pct_mean:.4}");
-        }
-        println!(
-            "{Y}STDDEV: {W}{:.4}{N}",
-            (s.iter().map(|&x| (x - m).powi(2)).sum::<f64>() / s.len() as f64).sqrt()
-        );
+        fatal(format_args!("{e}\n{}, FAIL", args.out.display()));
     }
 
     Ok(())

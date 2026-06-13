@@ -13,7 +13,8 @@ set -Eeuo pipefail
 install_deps() {
         ((UID != 0)) && { for i in sudo doas; do command -v "${i}" > /dev/null 2>&1 && priv="${i}"; done; }
 
-        for i in pacman dnf emerge brew; do command -v "${i}" > /dev/null 2>&1 && pm="${i}" || pm="unknown"; done
+        pm="unknown"
+        for i in pacman dnf emerge brew; do command -v "${i}" > /dev/null 2>&1 && pm="${i}"; done
 
         case "${pm}" in
                 "pacman")
@@ -105,6 +106,7 @@ handle_int() {
 
 trap 'handle_err' ERR
 trap 'handle_int' INT
+trap 'kill $(jobs -p) 2> /dev/null || true' EXIT
 
 show_opts() {
         opts=("${@}")
@@ -141,11 +143,17 @@ detect_deps() {
         done < <(find /usr/lib/gcc /usr/lib64/gcc -maxdepth 2 -type d 2> /dev/null || true)
 
         CLANG_RT_DIR="$(clang --print-runtime-dir 2> /dev/null || true)"
+        CLANG_RESOURCE_DIR="$(clang -print-resource-dir 2> /dev/null || true)"
         CLANG_LIB_DIRS=()
         [[ -n "${CLANG_RT_DIR}" && -d "${CLANG_RT_DIR}" ]] && CLANG_LIB_DIRS+=("${CLANG_RT_DIR}")
+        [[ -n "${CLANG_RESOURCE_DIR}" ]] && CLANG_LIB_DIRS+=(
+                "${CLANG_RESOURCE_DIR}/lib/linux"
+                "${CLANG_RESOURCE_DIR}/lib/darwin"
+                "${CLANG_RESOURCE_DIR}/lib"
+        )
         while IFS= read -r d; do
                 CLANG_LIB_DIRS+=("${d}")
-        done < <(find /usr/lib/clang /usr/lib64/clang -type d -name "linux" -o -type d -name "lib" 2> /dev/null || true)
+        done < <(find /usr/lib/clang /usr/lib64/clang /usr/lib/llvm /usr/lib64/llvm -type d \( -name "linux" -o -name "darwin" -o -name "lib" \) 2> /dev/null || true)
 
         ALL_STATIC_DIRS=("${SYS_LIB_DIRS[@]}" "${GCC_LIB_DIRS[@]}" "${CLANG_LIB_DIRS[@]}")
 
@@ -172,8 +180,11 @@ detect_deps() {
         LLVM_PATH="$(find_bin llvm-ar || true)"
         [[ -n "${LLVM_PATH}" ]] && HAS_LLVM=true || HAS_LLVM=false
 
-        COMPILERRT_PATH="$(find_lib libclang_rt.builtins.a "${CLANG_LIB_DIRS[@]}" "${ALL_STATIC_DIRS[@]}" || true)"
-        [[ -z "${COMPILERRT_PATH}" ]] && COMPILERRT_PATH="$(find_lib libclang_rt.builtins-x86_64.a "${CLANG_LIB_DIRS[@]}" "${ALL_STATIC_DIRS[@]}" || true)"
+        COMPILERRT_PATH=""
+        for rt_name in libclang_rt.builtins.a libclang_rt.builtins-x86_64.a libclang_rt.builtins-aarch64.a libclang_rt.osx.a; do
+                COMPILERRT_PATH="$(find_lib "${rt_name}" "${CLANG_LIB_DIRS[@]}" "${ALL_STATIC_DIRS[@]}" || true)"
+                [[ -n "${COMPILERRT_PATH}" ]] && break
+        done
         [[ -n "${COMPILERRT_PATH}" ]] && HAS_COMPILERRT=true || HAS_COMPILERRT=false
 
         HAS_HARD_REQS=true
@@ -200,33 +211,9 @@ detect_deps() {
         while IFS= read -r d; do
                 LLVM_LIB_DIRS+=("${d}")
         done < <(find /usr/lib/llvm /usr/lib64/llvm -maxdepth 3 -type d -name "lib64" -o -type d -name "lib" 2> /dev/null || true)
-        POLLY_PATH="$(find_lib libPolly.so "${SYS_LIB_DIRS[@]}" "${LLVM_LIB_DIRS[@]}" || true)"
-        [[ -z "${POLLY_PATH}" ]] && POLLY_PATH="$(find_lib LLVMPolly.so "${SYS_LIB_DIRS[@]}" "${LLVM_LIB_DIRS[@]}" || true)"
-        [[ -n "${POLLY_PATH}" ]] && HAS_POLLY=true || HAS_POLLY=false
 
         VSHIP_PATH="$(find_lib libvship.so "${SYS_LIB_DIRS[@]}" || true)"
         [[ -n "${VSHIP_PATH}" ]] && HAS_VSHIP=true || HAS_VSHIP=false
-
-        FFMPEG_PATH="$(find_bin ffmpeg || true)"
-        FFMPEG_VERSION=""
-        [[ -n "${FFMPEG_PATH}" ]] && {
-                HAS_FFMPEG=true
-                FFMPEG_VERSION="$(ffmpeg -version 2> /dev/null | head -1 || true)"
-        } || HAS_FFMPEG=false
-
-        MP4BOX_PATH="$(find_bin MP4Box || true)"
-        MP4BOX_VERSION=""
-        [[ -n "${MP4BOX_PATH}" ]] && {
-                HAS_MP4BOX=true
-                MP4BOX_VERSION="$(MP4Box -version 2>&1 | head -1 || true)"
-        } || HAS_MP4BOX=false
-
-        MKVMERGE_PATH="$(find_bin mkvmerge || true)"
-        MKVMERGE_VERSION=""
-        [[ -n "${MKVMERGE_PATH}" ]] && {
-                HAS_MKVMERGE=true
-                MKVMERGE_VERSION="$(mkvmerge --version 2> /dev/null | head -1 || true)"
-        } || HAS_MKVMERGE=false
 
         AVMENC_PATH="$(find_bin avmenc || true)"
         AVMENC_VERSION=""
@@ -322,10 +309,6 @@ show_build_menu() {
         echo -e "${C}╔═══════════════════════════════════════════════════════════════════════╗${N}"
         echo -e "${C}║${W}  Runtime Requirements                                                 ${C}║${N}"
         echo -e "${C}╚═══════════════════════════════════════════════════════════════════════╝${N}"
-        printf "  ${Y}%-30b${N} %b\n" "ffmpeg (Always needed for final muxing):" " $(dep_status "${HAS_FFMPEG}" "${FFMPEG_PATH}" "${FFMPEG_VERSION}")"
-        printf "  ${Y}%-30b${N} %b\n" "(Optional) MP4Box (create VVC timestamps):                 " " $(dep_status "${HAS_MP4BOX}" "${MP4BOX_PATH}" "${MP4BOX_VERSION}")"
-        printf "  ${Y}%-30b${N} %b\n" "(Optional) mkvmerge (create h26* timestamps):" "               $(dep_status "${HAS_MKVMERGE}" "${MKVMERGE_PATH}" "${MKVMERGE_VERSION}")"
-        echo
         echo -e "  ${W}Encoder Binaries (Optional):${N}"
         printf "  ${Y}%-30b${N} %b\n" "avmenc:" "$(dep_status "${HAS_AVMENC}" "${AVMENC_PATH}" "${AVMENC_VERSION}")"
         printf "  ${Y}%-30b${N} %b\n" "vvencFFapp:" "$(dep_status "${HAS_VVENCFFAPP}" "${VVENCFFAPP_PATH}" "${VVENCFFAPP_VERSION}")"
@@ -354,42 +337,94 @@ show_build_menu() {
 }
 
 cleanup_existing() {
-        local dirs=("dav1d" "FFmpeg" "opus" "libopusenc" "SVT-AV1" "vulkan")
-        local found=()
+        local -A artifacts=(
+                [dav1d]="lib/pkgconfig/dav1d.pc"
+                [FFmpeg]="install/lib/libavcodec.a"
+                [opus]="install/lib/libopus.a"
+                [libopusenc]="install/lib/libopusenc.a"
+                ["SVT-AV1"]="Bin/Release/libSvtAv1Enc.a"
+                [vulkan]="install/lib/pkgconfig/vulkan.pc"
+        )
 
-        for dir in "${dirs[@]}"; do
-                [[ -d "${BUILD_DIR}/${dir}" ]] && found+=("${dir}")
+        local successful=() incomplete=()
+        local dir
+
+        for dir in dav1d FFmpeg opus libopusenc SVT-AV1 vulkan; do
+                [[ -d "${BUILD_DIR}/${dir}" ]] || continue
+                [[ -f "${BUILD_DIR}/${dir}/${artifacts[${dir}]}" ]] && successful+=("${dir}") || incomplete+=("${dir}")
         done
 
-        [[ ${#found[@]} -eq 0 ]] && return
+        ((${#successful[@]} == 0 && ${#incomplete[@]} == 0)) && return
 
-        echo -e "\n${Y}Found existing build directories:${N}"
-        printf "  ${P}- %s${N}\n" "${found[@]}"
-
-        [[ -n "${preset}" ]] && loginf b "Using existing builds" || {
-                echo -ne "\n${C}Remove and rebuild? (y/n): ${N}"
-                read -r choice
-
-                [[ "${choice}" =~ ^[Yy]$ ]] && {
-                        for dir in "${found[@]}"; do
-                                loginf b "Removing ${BUILD_DIR}/${dir}"
-                                rm -rf "${BUILD_DIR:?}/${dir}" > "/dev/null" 2>&1
-                        done
-                        loginf g "Cleanup complete"
-                } || loginf b "Using existing builds"
+        ((${#successful[@]})) && {
+                echo -e "\n${G}Successful builds:${N}"
+                printf "  ${G}✓ %s${N}\n" "${successful[@]}"
         }
+
+        ((${#incomplete[@]})) && {
+                echo -e "\n${Y}Incomplete builds (will be deleted and rebuilt):${N}"
+                printf "  ${Y}✗ %s${N}\n" "${incomplete[@]}"
+        }
+
+        [[ -z "${preset}" ]] && ((${#successful[@]})) && {
+                echo -ne "\n${C}Update them too (re-clone latest from git)? (y/N): ${N}"
+                read -r choice
+                [[ "${choice}" =~ ^[Yy]$ ]] && {
+                        incomplete+=("${successful[@]}")
+                        successful=()
+                }
+        }
+
+        for dir in "${incomplete[@]}"; do
+                rm -rf "${BUILD_DIR:?}/${dir}"
+        done
 
         echo
 }
 
+clone_async() {
+        local target="${1}" url="${2}" extra="${3:-}"
+        [[ -d "${target}" ]] && return
+        (
+                logfile="/tmp/clone_$(basename "${target}")_$$.log"
+                git clone ${extra} "${url}" "${target}" > "${logfile}" 2>&1
+                rm -f "${logfile}"
+        ) &
+        pids+=("${!}")
+}
+
+clone_phase() {
+        loginf b "Cloning repositories in parallel"
+
+        local pids=()
+
+        mkdir -p "${BUILD_DIR}/vulkan"
+
+        clone_async "${BUILD_DIR}/opus" "https://gitlab.xiph.org/xiph/opus.git"
+        clone_async "${BUILD_DIR}/libopusenc" "https://gitlab.xiph.org/xiph/libopusenc.git"
+        clone_async "${BUILD_DIR}/SVT-AV1" "${svt_fork_url}"
+        clone_async "${BUILD_DIR}/dav1d" "https://code.videolan.org/videolan/dav1d.git"
+        clone_async "${BUILD_DIR}/vulkan/Vulkan-Headers" "https://github.com/KhronosGroup/Vulkan-Headers.git" "--depth 1"
+        clone_async "${BUILD_DIR}/vulkan/Vulkan-Loader" "https://github.com/KhronosGroup/Vulkan-Loader.git" "--depth 1"
+        clone_async "${BUILD_DIR}/FFmpeg" "https://github.com/FFmpeg/FFmpeg"
+
+        local pid rc=0
+        for pid in "${pids[@]}"; do
+                wait "${pid}" || rc="${?}"
+        done
+        ((rc)) && exit 1
+
+        loginf g "Clones complete"
+}
+
 build_dav1d() {
-        [[ -d "${BUILD_DIR}/dav1d" ]] && return
+        [[ -f "${BUILD_DIR}/dav1d/lib/pkgconfig/dav1d.pc" ]] && return
 
         loginf b "Building dav1d"
 
         local logfile="/tmp/build_dav1d_$.log"
+        : > "${logfile}"
 
-        git clone https://code.videolan.org/videolan/dav1d.git "${BUILD_DIR}/dav1d" > "${logfile}" 2>&1
         cd "${BUILD_DIR}/dav1d"
         meson setup build --default-library=static \
                 --buildtype=release \
@@ -417,24 +452,19 @@ build_dav1d() {
 }
 
 build_vulkan() {
-        [[ -d "${BUILD_DIR}/vulkan" ]] && return
+        [[ -f "${BUILD_DIR}/vulkan/install/lib/pkgconfig/vulkan.pc" ]] && return
 
         loginf b "Building Vulkan (headers + loader)"
 
         local logfile="/tmp/build_vulkan_$.log"
         local install_dir="${BUILD_DIR}/vulkan/install"
+        : > "${logfile}"
 
-        mkdir -p "${BUILD_DIR}/vulkan"
-
-        git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git \
-                "${BUILD_DIR}/vulkan/Vulkan-Headers" > "${logfile}" 2>&1
         cmake -S "${BUILD_DIR}/vulkan/Vulkan-Headers" -B "${BUILD_DIR}/vulkan/Vulkan-Headers/build" \
                 -G Ninja \
                 -DCMAKE_INSTALL_PREFIX="${install_dir}" >> "${logfile}" 2>&1
         ninja -C "${BUILD_DIR}/vulkan/Vulkan-Headers/build" install >> "${logfile}" 2>&1
 
-        git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Loader.git \
-                "${BUILD_DIR}/vulkan/Vulkan-Loader" >> "${logfile}" 2>&1
         sed -i 's/add_library(vulkan SHARED)/add_library(vulkan STATIC)/' \
                 "${BUILD_DIR}/vulkan/Vulkan-Loader/loader/CMakeLists.txt"
         sed -i '/install(TARGETS vulkan EXPORT/d; /install(EXPORT VulkanLoaderConfig/d' \
@@ -482,17 +512,16 @@ build_vulkan() {
 }
 
 build_ffmpeg() {
-        [[ -d "${BUILD_DIR}/FFmpeg" ]] && return
+        [[ -f "${BUILD_DIR}/FFmpeg/install/lib/libavcodec.a" ]] && return
 
         loginf b "Building FFmpeg"
 
         export PKG_CONFIG_PATH="${BUILD_DIR}/dav1d/lib/pkgconfig:${BUILD_DIR}/vulkan/install/lib/pkgconfig:${BUILD_DIR}/FFmpeg/install/lib/pkgconfig"
 
         local logfile="/tmp/build_ffmpeg_$.log"
+        : > "${logfile}"
 
-        cd "${BUILD_DIR}"
-        git clone "https://github.com/FFmpeg/FFmpeg" > "${logfile}" 2>&1
-        cd "FFmpeg"
+        cd "${BUILD_DIR}/FFmpeg"
 
         local vk_inc="${BUILD_DIR}/vulkan/install/include"
         local vk_lib="${BUILD_DIR}/vulkan/install/lib"
@@ -512,10 +541,6 @@ build_ffmpeg() {
                 --pkg-config-flags="--static" \
                 --disable-programs \
                 --disable-doc \
-                --disable-htmlpages \
-                --disable-manpages \
-                --disable-podpages \
-                --disable-txtpages \
                 --disable-network \
                 --disable-autodetect \
                 --disable-all \
@@ -523,7 +548,6 @@ build_ffmpeg() {
                 --enable-avcodec \
                 --enable-avformat \
                 --enable-avutil \
-                --enable-swscale \
                 --enable-swresample \
                 --enable-protocol=file \
                 --enable-demuxer=matroska \
@@ -613,6 +637,8 @@ build_ffmpeg() {
                 --enable-hwaccel=h264_vulkan \
                 --enable-hwaccel=hevc_vulkan \
                 --enable-hwaccel=av1_vulkan \
+                --enable-bsf=extract_extradata \
+                --enable-demuxer=ogg \
                 --enable-hwaccel=vp9_vulkan >> "${logfile}" 2>&1
 
         make -j"$(nproc)" >> "${logfile}" 2>&1
@@ -628,19 +654,19 @@ build_ffmpeg() {
 }
 
 build_opus() {
-        [[ -d "${BUILD_DIR}/opus" ]] && return
+        [[ -f "${BUILD_DIR}/opus/install/lib/libopus.a" ]] && return
 
         loginf b "Building opus"
 
         local logfile="/tmp/build_opus_$.log"
+        : > "${logfile}"
 
-        git clone https://gitlab.xiph.org/xiph/opus.git "${BUILD_DIR}/opus" > "${logfile}" 2>&1
         cd "${BUILD_DIR}/opus"
         cmake -B build -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX="${BUILD_DIR}/opus/install" \
                 -DCMAKE_C_COMPILER="${CC}" \
-                -DCMAKE_C_FLAGS="${CFLAGS}" \
+                -DCMAKE_C_FLAGS="${CFLAGS/ -ffast-math/}" \
                 -DCMAKE_INSTALL_LIBDIR=lib \
                 -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
                 -DOPUS_BUILD_TESTING=OFF \
@@ -661,13 +687,13 @@ build_opus() {
 }
 
 build_opusenc() {
-        [[ -d "${BUILD_DIR}/libopusenc" ]] && return
+        [[ -f "${BUILD_DIR}/libopusenc/install/lib/libopusenc.a" ]] && return
 
         loginf b "Building libopusenc"
 
         local logfile="/tmp/build_opusenc_$.log"
+        : > "${logfile}"
 
-        git clone https://gitlab.xiph.org/xiph/libopusenc.git "${BUILD_DIR}/libopusenc" > "${logfile}" 2>&1
         cd "${BUILD_DIR}/libopusenc"
         ./autogen.sh >> "${logfile}" 2>&1
         PKG_CONFIG_PATH="${BUILD_DIR}/opus/install/lib/pkgconfig" \
@@ -693,24 +719,22 @@ build_opusenc() {
 }
 
 build_svtav1() {
-        [[ -d "${BUILD_DIR}/SVT-AV1" ]] && return
+        [[ -f "${BUILD_DIR}/SVT-AV1/Bin/Release/libSvtAv1Enc.a" ]] && return
 
         loginf b "Building SVT-AV1 (${svt_fork_name})"
 
         local logfile="/tmp/build_svtav1_$.log"
         local pgo_dir="${BUILD_DIR}/SVT-AV1/pgo"
+        : > "${logfile}"
 
         pgo_params=(
                 --preset 1 --tune 0 --keyint 0 --scd 0 --scm 0 --tile-rows 0 --tile-columns 0 --rc 0
-                --width 1920 --height 1080 --forced-max-frame-width 1920 --forced-max-frame-height 1080
-                --frames 65 --nb 65 --fps-num 60 --fps-denom 1 --input-depth 10 --profile 0
-                --color-format 1 --asm max --color-range 0 --color-primaries 1
-                --transfer-characteristics 1 --matrix-coefficients 1 --chroma-sample-position 1
-                --progress 0 --no-progress 1 --lp 5 --enable-qm 1 --enable-variance-boost 1
-                --luminance-qp-bias 0 --sharpness 1 --passes 1 --film-grain 0
+                --width 1920 --height 1080 --frames 96 --fps-num 60 --fps-denom 1 --input-depth 10 --profile 0
+                --color-format 1 --color-range 0 --color-primaries 1 --transfer-characteristics 1
+                --matrix-coefficients 1 --chroma-sample-position 1 --progress 0 --lp 5 --enable-qm 1
+                --enable-variance-boost 1 --luminance-qp-bias 0 --sharpness 1
         )
 
-        git clone "${svt_fork_url}" "${BUILD_DIR}/SVT-AV1" > "${logfile}" 2>&1
         cd "${BUILD_DIR}/SVT-AV1"
 
         sed -i 's/set(CMAKE_POSITION_INDEPENDENT_CODE ON)/set(CMAKE_POSITION_INDEPENDENT_CODE OFF)/' CMakeLists.txt
@@ -724,10 +748,15 @@ build_svtav1() {
         sed -i '/gnull/s/^/#/' CMakeLists.txt
         sed -i 's|"${LLVM_PROFDATA} merge --sparse=true \*.profraw -o default.profdata"|"cd ${SVT_AV1_PGO_DIR} \&\& ${LLVM_PROFDATA} merge --sparse=true *.profraw -o default.profdata"|' CMakeLists.txt
 
+        # 8 MB thread stacks (default 1 MiB overflows with PGO)
+        sed -i 's|0, // default stack size|8 * 1024 * 1024, // default stack size|' Source/Lib/Codec/svt_threads.c
+        sed -i 's|0, // thread active when created|STACK_SIZE_PARAM_IS_A_RESERVATION, // thread active when created|' Source/Lib/Codec/svt_threads.c
+        sed -i 's|const size_t min_stack_size = 1024 \* 1024;|const size_t min_stack_size = 8 * 1024 * 1024;|' Source/Lib/Codec/svt_threads.c
+
         mkdir -p "${pgo_dir}"
         loginf b "Downloading PGO training video"
         curl -L "https://media.xiph.org/video/derf/webm/Netflix_FoodMarket2_4096x2160_60fps_10bit_420.webm" -o "${pgo_dir}/i.webm" >> "${logfile}" 2>&1
-        ffmpeg -hide_banner -v error -stats -y -nostdin -i "${pgo_dir}/i.webm" -frames:v 65 -vf "scale=1920:1080:flags=lanczos+accurate_rnd+full_chroma_int:param0=4" -pix_fmt yuv420p10le -strict -1 -f rawvideo "${pgo_dir}/i.yuv" >> "${logfile}" 2>&1
+        ffmpeg -hide_banner -v error -stats -y -nostdin -i "${pgo_dir}/i.webm" -frames:v 96 -vf "scale=1920:1080:flags=lanczos+accurate_rnd+full_chroma_int:param0=4" -pix_fmt yuv420p10le -strict -1 -f rawvideo "${pgo_dir}/i.yuv" >> "${logfile}" 2>&1
         rm -f "${pgo_dir}/i.webm"
 
         cd Build/linux
@@ -761,29 +790,15 @@ setup_toolchain() {
         export OBJCOPY="llvm-objcopy"
         export OBJDUMP="llvm-objdump"
 
-        [[ "${HAS_POLLY}" == true ]] && export POLLY_FLAGS="-mllvm -polly \
--mllvm -polly-position=before-vectorizer \
--mllvm -polly-parallel \
--mllvm -polly-omp-backend=LLVM \
--mllvm -polly-vectorizer=stripmine \
--mllvm -polly-tiling \
--mllvm -polly-register-tiling \
--mllvm -polly-2nd-level-tiling \
--mllvm -polly-detect-keep-going \
--mllvm -polly-enable-delicm=true \
--mllvm -polly-dependences-computeout=2 \
--mllvm -polly-postopts=true \
--mllvm -polly-pragma-based-opts \
--mllvm -polly-pattern-matching-based-opts=true \
--mllvm -polly-reschedule=true \
--mllvm -enable-loop-distribute \
--mllvm -enable-unroll-and-jam \
--mllvm -polly-ast-use-context \
--mllvm -polly-invariant-load-hoisting \
--mllvm -polly-run-inliner \
--mllvm -polly-run-dce"
-
-        export COMMON_FLAGS="-O3 -march=native -mtune=native -flto=thin -pipe -fno-math-errno -fomit-frame-pointer -fno-semantic-interposition -fno-stack-protector -fno-stack-clash-protection -fno-sanitize=all -fno-dwarf2-cfi-asm ${POLLY_FLAGS:-} -fno-pic -fno-pie"
+        export COMMON_FLAGS="-O3 -ffast-math -march=native -mtune=native \
+	-fwhole-program-vtables -flto=thin -fno-semantic-interposition \
+	-fno-stack-protector -fno-stack-clash-protection -fno-sanitize=all \
+	-fno-dwarf2-cfi-asm -fno-pic -fno-pie -fno-unwind-tables \
+	-fno-asynchronous-unwind-tables -fno-plt -fno-stack-check \
+	-fno-threadsafe-statics -mno-vzeroupper -mno-retpoline -mno-lvi-cfi \
+	-mharden-sls=none -mno-lvi-hardening -ftls-model=local-exec \
+	-fno-use-cxa-atexit"
+        "${IS_MAC}" && export COMMON_FLAGS="${COMMON_FLAGS//-mno-vzeroupper/}"
         export CFLAGS="${COMMON_FLAGS}"
         "${IS_MAC}" && export CXXFLAGS="${COMMON_FLAGS} -stdlib=libc++" || export CXXFLAGS="${COMMON_FLAGS} -stdlib=libstdc++"
         unset LDFLAGS
@@ -849,17 +864,14 @@ main() {
                 1)
                         config_file=".cargo/config.toml.static"
                         cargo_features="--no-default-features --features vship"
-                        build_static=true
                         ;;
                 2)
                         config_file=".cargo/config.toml.static"
                         cargo_features="--no-default-features --features vship"
-                        build_static=false
                         ;;
                 3)
                         config_file=".cargo/config.toml.static"
                         cargo_features="--no-default-features"
-                        build_static=true
                         ;;
         esac
 
@@ -895,6 +907,7 @@ main() {
                 done
         }
         svt_fork_name="${SVT_FORK_NAMES[fork_idx]}"
+        [[ "${svt_fork_name}" == "essential" ]] && cargo_features+=" --features svt-essential"
         svt_fork_url="${SVT_FORK_URLS[fork_idx]}"
         loginf g "SVT-AV1 fork: ${svt_fork_name}"
 
@@ -902,14 +915,26 @@ main() {
 
         setup_toolchain
 
-        build_opus
-        build_opusenc
+        clone_phase
 
-        build_svtav1
+        build_opus &
+        PID_OPUS="${!}"
+        build_dav1d &
+        PID_DAV1D="${!}"
+        build_vulkan &
+        PID_VULKAN="${!}"
+        build_svtav1 &
+        PID_SVTAV1="${!}"
 
-        build_dav1d
-        build_vulkan
-        build_ffmpeg
+        wait "${PID_OPUS}" || exit 1
+        build_opusenc &
+        PID_OPUSENC="${!}"
+
+        wait "${PID_DAV1D}" && wait "${PID_VULKAN}" || exit 1
+        build_ffmpeg &
+        PID_FFMPEG="${!}"
+
+        wait "${PID_OPUSENC}" && wait "${PID_FFMPEG}" && wait "${PID_SVTAV1}" || exit 1
 
         cd "${XAV_DIR}"
 
@@ -919,15 +944,12 @@ main() {
         loginf b "Building XAV"
 
         local logfile="/tmp/build_cargo_$.log"
-        local binary_path
-
-        [[ "${build_static}" == true ]] && binary_path="target/x86_64-unknown-linux-gnu/release/xav" || binary_path="target/release/xav"
-        "${IS_MAC}" && binary_path="target/release/xav"
 
         cargo build --release ${cargo_features} > "${logfile}" 2>&1 && {
                 rm -f "${logfile}"
                 loginf g "Build complete"
-                loginf g "Binary: ${XAV_DIR}/${binary_path}"
+                loginf g "Binary: ${XAV_DIR}/target/release/xav"
+                /usr/bin/ls -la "${XAV_DIR}/target/release/xav" --color=always
         } || {
                 echo -e "\n${R}Build failed! Output:${N}\n"
                 cat "${logfile}"
