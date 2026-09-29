@@ -29,4 +29,4 @@ COPY ./ /xav
 RUN dnf install -y glibc-static libstdc++-static nasm rustup clang clang-libs llvm lld compiler-rt llvm-libunwind-static autoconf automake libtool cmake ninja-build pkgconf meson
 RUN dnf install -y ffmpeg-free-devel gpac mkvtoolnix ffmpeg-free
 RUN /xav/build.sh static_tq mainline
-RUN cp /xav/target/x86_64-unknown-linux-gnu/release/xav /usr/bin/xav
+RUN cp /xav/target/release/xav /usr/bin/xav
