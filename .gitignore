@@ -8,6 +8,8 @@
 !build.rs
 !build.sh
 !Cargo.toml
+!flake.nix
+!flake.lock
 !LICENSE
 !README.md
 !vship.mk
